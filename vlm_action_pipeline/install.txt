@@ -1,0 +1,6 @@
+conda env create -f qwen_environment.yml
+conda env create -f ufllama_environment.yml
+conda env create -f grounding_environment.yml
+
+cd demo_pipeline
+wget https://ml-site.cdn-apple.com/models/depth-pro/depth_pro.pt

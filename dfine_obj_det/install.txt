@@ -1,0 +1,6 @@
+conda env create -f environment.yml
+
+
+wget https://github.com/Peterande/storage/releases/download/dfinev1.0/dfine_x_obj365.pth
+cd configs/dfine
+wget https://github.com/Peterande/storage/releases/download/dfinev1.0/dfine_x_obj2coco.pth

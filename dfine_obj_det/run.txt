@@ -1,0 +1,3 @@
+conda activate dfine2
+cd tools/inference
+CUDA_VISIBLE_DEVICES=0 python object_proposer_api.py

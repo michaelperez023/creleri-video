@@ -1,0 +1,7 @@
+#assuming you have conda and ffmpeg installed
+conda activate opentad4 
+CUDA_VISIBLE_DEVICES=1 python celery_worker.py -d 0
+
+#new terminal
+conda activate opentad4
+CUDA_VISIBLE_DEVICES=1 python api.py -p 17249

@@ -1,0 +1,18 @@
+conda env create -f environment.yml
+
+download best.pth from: https://drive.google.com/file/d/1GZl1UIDW8Qs0-I-sgeEW1NAGL8plXA3M/view?usp=sharing
+using some command like:
+pip install down
+gdown --id 1GZl1UIDW8Qs0-I-sgeEW1NAGL8plXA3M -O best.pth
+
+#wget vit-giant-p14_videomaev2-hybrid_pt_1200e_k710_ft_my.pth
+#this file used to be available by visiting:
+https://github.com/OpenGVLab/VideoMAEv2/blob/master/docs/MODEL_ZOO.md#model-weight-links
+#filling out this download request form:
+https://docs.google.com/forms/d/e/1FAIpQLSd1SjKMtD8piL9uxGEUwicerxd46bs12QojQt92rzalnoI3JA/viewform
+#then converting the file by running:
+python tools/model_converters/convert_videomaev2.py \
+    vit_g_hybrid_pt_1200e_k710_ft.pth pretrained/vit-giant-p14_videomaev2-hybrid_pt_1200e_k710_ft_my.pth
+
+#now, the download request form links to a public huggingface model:
+https://huggingface.co/OpenGVLab/VideoMAEv2-giant
