@@ -1,2 +1,0 @@
-cd redis-stable
-src/redis-server --port 17253

@@ -1,0 +1,16 @@
+Metadata-Version: 2.2
+Name: Align1D
+Version: 2.5.0
+Summary: A small package for 1d aligment in cuda
+Home-page: https://github.com/Frostinassiky/G-TAD
+Author: Frost Mengmeng Xu
+Author-email: xu.frost@gmail.com
+Description-Content-Type: text/markdown
+Dynamic: author
+Dynamic: author-email
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: summary
+
+Update: support pytorch 1.11

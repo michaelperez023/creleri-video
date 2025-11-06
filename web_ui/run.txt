@@ -1,3 +1,0 @@
-Source python app.py 5004
-
-Go to: http://localhost:5004
