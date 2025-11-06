@@ -1,4 +1,3 @@
-
 # CReLeRI: Explainable, Concept-Centric Video Analysis System
 
 Authors:
@@ -38,7 +37,7 @@ Paper on ACM Digital Library: https://doi.org/10.1145/3746027.3754479
 
 # Install
 
-1. temporal segmentation server
+1. temporal segmentation server \
 cd adatad_temp_seg \
 conda env create -f environment.yml 
 
@@ -59,7 +58,7 @@ python tools/model_converters/convert_videomaev2.py \
 #now, the download request form links to a public huggingface model: \
 https://huggingface.co/OpenGVLab/VideoMAEv2-giant
 
-2. object detection server
+2. object detection server \
 cd dfine_obj_det \
 conda env create -f environment.yml
 
@@ -107,7 +106,7 @@ Notes: \
 #The local Llama-3.3 configuration (non-UF deployment, llama32_api.py) has not been recently tested. If running outside of UF, ensure an updated model path/checkpoint and a fresh environment are configured. \
 #install the environments for each API first before running them via the install.txt in each subdirectory. 
 
-1. WebUI
+1. WebUI \
 #New terminal \
 #assuming you have ffmpeg \
 cd web_ui \
@@ -121,35 +120,35 @@ python app.py 5004 \
 cd redis/redis-stable \
 src/redis-server --port 17253
 
-3. action segmentation API - celery worker
+3. action segmentation API - celery worker \
 #new terminal \
 #assuming you have conda and ffmpeg \
 conda activate opentad4 \
 cd adatad_temp_seg \
 CUDA_VISIBLE_DEVICES=1 python celery_worker.py -d 0
 
-4. action segmentation API - api
+4. action segmentation API - api \
 #new terminal \
 #assuming you have conda \
 conda activate opentad4 \
 cd adatad_temp_seg \
 CUDA_VISIBLE_DEVICES=1 python api.py -p 17249
 
-5. Dfine object detection API
+5. Dfine object detection API \
 #new terminal \
 #assuming you have conda \
 conda activate dfine2 \
 cd dfine_obj_det/tools/inference \
 CUDA_VISIBLE_DEVICES=0 python object_proposer_api.py
 
-6. qwen2.5-VL API
+6. qwen2.5-VL API \
 #assuming you have conda and cuda/12.8.1 \
 conda activate qwen3 \
 cd vlm_action_pipeline/demo_pipeline \
 export PYTHONNOUSERSITE=1 \
 python qwen2p5_api.py
 
-7. llama3.3 API
+7. llama3.3 API \
 #assuming you have conda \
 #if on UF campus \
 conda activate ufllama \
@@ -159,7 +158,7 @@ python llama_3p3_api.py
 #otherwise
 python llama32_api.py
 
-8. grounding API
+8. grounding API \
 #assuming you have conda and ffmpeg \
 conda activate demo_pipeline \
 cd vlm_action_pipeline/demo_pipeline \
@@ -185,4 +184,4 @@ numpages = {3},
 keywords = {grounding, human-centered computing, interpretability, large language models, multimedia interaction, object detection, video action detection, vision-language models},
 location = {Dublin, Ireland},
 series = {MM '25}
-}```
+}
