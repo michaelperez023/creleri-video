@@ -68,6 +68,7 @@ wget https://github.com/Peterande/storage/releases/download/dfinev1.0/dfine_x_ob
 
 3. redis
 
+mkdir redis \
 cd redis \
 wget https://download.redis.io/redis-stable.tar.gz \
 tar -xzvf redis-stable.tar.gz \
