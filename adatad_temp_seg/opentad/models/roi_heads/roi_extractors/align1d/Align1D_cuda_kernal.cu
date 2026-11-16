@@ -1,3 +1,5 @@
+// Modified from OpenTAD (https://github.com/sming256/OpenTAD), Apache-2.0: dispatches on
+// scalar_type() so the extension builds with PyTorch 2.9.
 // Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 // Modifies by Frost for 1D ussage
 #include <ATen/ATen.h>
@@ -227,7 +229,7 @@ at::Tensor Align_forward_cuda(const at::Tensor& input,
     return output;
   }
 
-  AT_DISPATCH_FLOATING_TYPES(input.type(), "Align1D_forward", [&] {
+  AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "Align1D_forward", [&] {
     Align1DForward<scalar_t><<<grid, block, 0, stream>>>(
          output_size,
          input.contiguous().data<scalar_t>(),
@@ -269,7 +271,7 @@ at::Tensor Align_backward_cuda(const at::Tensor& grad,
     return grad_input;
   }
 
-  AT_DISPATCH_FLOATING_TYPES(grad.type(), "ROIAlign_backward", [&] {
+  AT_DISPATCH_FLOATING_TYPES(grad.scalar_type(), "ROIAlign_backward", [&] {
     Align1DBackwardFeature<scalar_t><<<grid, block, 0, stream>>>(
          grad.numel(),
          grad.contiguous().data<scalar_t>(),
