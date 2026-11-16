@@ -1,52 +1,54 @@
-from flask import Flask, request, jsonify
-import threading
-import traceback
+"""Qwen2.5-VL captioning service (POST /qwen) for the per-object track clips."""
+
+import argparse
+import json
 import os
 import tempfile
+import threading
+import traceback
+
 import torch
-import json
-
-from transformers import AutoProcessor
-from transformers import Qwen2_5_VLForConditionalGeneration
-
+from flask import Flask, jsonify, request
 from qwen_vl_utils import process_vision_info
-
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 lock = threading.Lock()
 
 MODEL_ID = "Qwen/Qwen2.5-VL-32B-Instruct"
-max_mem = {0: "1GiB", 1: "140GiB", 2: "140GiB", 3: "140GiB"}
-# max_mem = {0: "1GiB", 1: "210GiB", 2: "210GiB"}
-# model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-#    "Qwen/Qwen2.5-VL-32B-Instruct",
-#    dtype="auto",
-#    device_map="auto",
-#    max_memory=max_mem
-# )
+# Sized for 4x B200, keeping GPU 0 nearly free for the other services.
+MAX_MEMORY = ["1GiB", "140GiB", "140GiB", "140GiB"]
+# Content keys qwen_vl_utils loads media from.
+MEDIA_KEYS = ("image", "image_url", "video")
 
-# We recommend enabling flash_attention_2 for better acceleration and memory saving, especially in multi-image and video scenarios.
-model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    "Qwen/Qwen2.5-VL-32B-Instruct",
-    dtype=torch.bfloat16,
-    attn_implementation="flash_attention_2",
-    device_map="auto",
-    max_memory=max_mem,
-)
+model = processor = None  # set by load_model()
 
-processor = AutoProcessor.from_pretrained(MODEL_ID)
 
-tok = processor.tokenizer
-tok.padding_side = "left"
+def load_model(model_id: str, max_memory: dict, attn_implementation: str):
+    global model, processor
+    # We recommend enabling flash_attention_2 for better acceleration and memory saving, especially in multi-image and video scenarios.
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        model_id,
+        dtype=torch.bfloat16,
+        attn_implementation=attn_implementation,
+        device_map="auto",
+        max_memory=max_memory,
+    )
 
-if tok.pad_token_id is None:
-    tok.pad_token = tok.eos_token  # safe default
+    processor = AutoProcessor.from_pretrained(model_id)
 
-# keep model configs in sync (helps generate/beam code paths)
-model.config.pad_token_id = tok.pad_token_id
-model.generation_config.pad_token_id = tok.pad_token_id
+    tok = processor.tokenizer
+    tok.padding_side = "left"
 
-# (optional but often helpful for long prompts)
-tok.truncation_side = "left"
+    if tok.pad_token_id is None:
+        tok.pad_token = tok.eos_token  # safe default
+
+    # keep model configs in sync (helps generate/beam code paths)
+    model.config.pad_token_id = tok.pad_token_id
+    model.generation_config.pad_token_id = tok.pad_token_id
+
+    # (optional but often helpful for long prompts)
+    tok.truncation_side = "left"
+
 
 app = Flask(__name__)
 
@@ -60,86 +62,61 @@ def _parse_bool(val):
     return s in {"1", "true", "yes", "y", "on"}
 
 
-def _ensure_list(x):
-    return x if isinstance(x, list) else [x]
+def _is_turn(turn) -> bool:
+    if not isinstance(turn, dict):
+        return False
+    content = turn.get("content")
+    return isinstance(content, str) or (
+        isinstance(content, list)
+        and all(isinstance(part, dict) and "type" in part for part in content)
+    )
 
 
-def _save_uploaded_image_files(image_files):
-    """
-    Save uploaded image files to temp PNGs and return a list of file:// paths.
-    """
-    temp_paths = []
-    for file_storage in image_files:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-            if isinstance(file_storage, (bytes, bytearray)):
-                tmp.write(file_storage)
-            else:
-                tmp.write(file_storage.read())
-            temp_paths.append("file://" + tmp.name)
-    return temp_paths
+def _is_conversation(conv) -> bool:
+    return isinstance(conv, list) and bool(conv) and all(_is_turn(t) for t in conv)
 
 
-def _inject_image_paths_into_messages(messages, image_paths):
-    """
-    Fill/append image content items in order with the given file:// paths.
-    If there are more images than existing 'type':'image' items, append the extras
-    to the first user message's content.
-    """
-    if not image_paths:
-        return messages
-
-    # Flatten references to all 'image' content slots (in order)
-    image_slots = []
-    for conv in _ensure_list(messages):
+def _content_parts(convs):
+    for conv in convs:
         for turn in conv:
-            content = turn.get("content", [])
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "image":
-                    image_slots.append(item)
-
-    # Fill existing slots first
-    i = 0
-    for slot in image_slots:
-        if i >= len(image_paths):
-            break
-        slot["image"] = image_paths[i]
-        i += 1
-
-    # If leftover images, append them to the first user turn’s content
-    if i < len(image_paths):
-        # Find first turn to append to (prefer a 'user' role)
-        first_turn = None
-        for conv in _ensure_list(messages):
-            for turn in conv:
-                if turn.get("role") == "user":
-                    first_turn = turn
-                    break
-            if first_turn:
-                break
-        if first_turn is None:
-            # fallback: just use the very first turn
-            first_turn = messages[0][0] if isinstance(messages[0], list) else messages[0]
-
-        first_turn.setdefault("content", [])
-        for p in image_paths[i:]:
-            first_turn["content"].insert(0, {"type": "image", "image": p})
-
-    return messages
+            if isinstance(turn["content"], list):
+                yield from turn["content"]
 
 
-def _inject_video_path_into_messages(messages, path):
-    """Replace any 'video' entries with a *plain* local path."""
+def _inject_image_paths(convs, image_paths):
+    """
+    Fill 'type':'image' items in order with the given paths. Images beyond the existing
+    items are inserted, in order, at the start of the first user turn's content.
+    """
+    slots = [part for part in _content_parts(convs) if part["type"] == "image"]
+    for slot, path in zip(slots, image_paths):
+        slot["image"] = path
 
-    def patch_conv(conv):
-        for turn in conv:
-            for part in turn.get("content", []):
-                if part.get("type") == "video":
-                    part["video"] = path  # <- no 'file://'
-        return conv
+    extra = image_paths[len(slots) :]
+    if extra:
+        # prefer the first 'user' turn, else the very first turn
+        turn = next((t for conv in convs for t in conv if t.get("role") == "user"), convs[0][0])
+        if isinstance(turn["content"], str):
+            turn["content"] = [{"type": "text", "text": turn["content"]}]
+        turn["content"][:0] = [{"type": "image", "image": p} for p in extra]
 
-    if isinstance(messages, list) and messages and isinstance(messages[0], list):
-        return [patch_conv(conv) for conv in messages]  # batch
-    return patch_conv(messages)  # single
+
+def _inject_video_path(convs, path):
+    """Point every 'video' item at the uploaded file."""
+    for part in _content_parts(convs):
+        if part["type"] == "video":
+            part["video"] = path
+
+
+def _only_uploaded_media(convs, paths) -> bool:
+    """True if every item qwen_vl_utils would load as an image or video is one of `paths`."""
+    for part in _content_parts(convs):
+        refs = [part[key] for key in MEDIA_KEYS if key in part]
+        if not refs and part["type"] not in MEDIA_KEYS:
+            continue
+        if not refs or any(ref not in paths for ref in refs):
+            return False
+    return True
 
 
 def _is_single_conv(msgs):
@@ -188,17 +165,12 @@ def vlm_generate(messages, max_new_tokens=128):
     with torch.no_grad():
         gen_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
 
-    # 5) Trim prompts using non-pad lengths
-    pad_id = getattr(processor.tokenizer, "pad_token_id", None)
-    prompt_lens = (
-        (inputs.input_ids != pad_id).sum(dim=1).tolist()
-        if pad_id is not None
-        else [len(ids) for ids in inputs.input_ids]
-    )
+    # 5) Trim prompts: rows are left-padded to the same length, so every answer starts there
+    prompt_len = inputs.input_ids.shape[1]
 
     outs = []
-    for i, out_ids in enumerate(gen_ids):
-        trimmed = out_ids[prompt_lens[i] :]
+    for out_ids in gen_ids:
+        trimmed = out_ids[prompt_len:]
         outs.append(
             processor.batch_decode(
                 [trimmed], skip_special_tokens=True, clean_up_tokenization_spaces=False
@@ -219,100 +191,87 @@ def qwen():
       - is_batch: optional truthy string ("true", "1", etc.)
       - image: one or more uploaded images (optional)
       - video: exactly one uploaded video (optional)
-    Exactly one of 'image' or 'video' must be provided.
+    Exactly one of 'image' or 'video' must be provided. Every 'video' item is pointed at the
+    uploaded video, and 'image' items are filled with the uploaded images (see
+    _inject_image_paths). Messages may not reference any other media.
     """
+    # Prefer 'video' if provided
+    if "video" in request.files:
+        media_type, uploads, suffix = "video", [request.files["video"]], ".mp4"
+    elif "image" in request.files:
+        media_type, uploads, suffix = "image", request.files.getlist("image"), ".png"
+    else:
+        return jsonify({"error": "no vision file found"}), 400
+    if any(f.filename == "" for f in uploads):
+        return jsonify({"error": f"no chosen {media_type} file"}), 400
+
+    if "messages" not in request.form:
+        return jsonify({"error": "messages field is required"}), 400
+
     try:
-        media_type = None
+        messages = json.loads(request.form["messages"])
+    except json.JSONDecodeError as e:
+        return jsonify({"error": f"Invalid JSON in messages: {e}"}), 400
 
-        # Prefer 'video' if provided
-        if "video" in request.files:
-            video_file = request.files["video"]
-            if video_file.filename == "":
-                return jsonify({"error": "no chosen video file"}), 400
-            media_type = "video"
-        elif "image" in request.files:
-            # Could be multiple images
-            image_files = request.files.getlist("image")
-            if not image_files:
-                return jsonify({"error": "no chosen image file"}), 400
-            media_type = "image"
-        else:
-            return jsonify({"error": "no vision file found"}), 400
+    is_batch = _parse_bool(request.form.get("is_batch", False))
 
-        if "messages" not in request.form:
-            return jsonify({"error": "messages field is required"}), 400
-
-        # Safer than eval
-        try:
-            messages = json.loads(request.form["messages"])
-        except json.JSONDecodeError as e:
-            return jsonify({"error": f"Invalid JSON in messages: {e}"}), 400
-
-        is_batch = _parse_bool(request.form.get("is_batch", False))
-
-        # Normalize messages shape for processor:
-        # - single: list[turn]
-        # - batch:  list[list[turn]]
+    # Normalize to a list of conversations (list[list[turn]])
+    convs = messages if is_batch else [messages]
+    if not (isinstance(convs, list) and convs and all(_is_conversation(c) for c in convs)):
         if is_batch:
-            if not (isinstance(messages, list) and messages and isinstance(messages[0], list)):
-                return jsonify(
-                    {
-                        "error": "Batch mode expects messages to be a list of conversations (list[list[turn]])"
-                    }
-                ), 400
+            error = "Batch mode expects messages to be a list of conversations (list[list[turn]])"
         else:
-            if not (isinstance(messages, list) and messages and isinstance(messages[0], dict)):
-                return jsonify(
-                    {
-                        "error": "Single mode expects messages to be a single conversation (list[turn])"
-                    }
-                ), 400
+            error = "Single mode expects messages to be a single conversation (list[turn])"
+        return jsonify({"error": error}), 400
 
-        with lock:
-            temp_paths_to_cleanup = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        paths = []
+        for i, upload in enumerate(uploads):
+            path = os.path.join(tmpdir, f"{media_type}{i}{suffix}")
+            upload.save(path)
+            paths.append(path)
 
-            if media_type == "video":
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-                    tmp.write(video_file.read())
-                    tmp_path = tmp.name
-                    temp_paths_to_cleanup.append(tmp_path)
-                messages = _inject_video_path_into_messages(messages, tmp_path)
-
-            elif media_type == "image":
-                image_paths = []
-                for f in image_files:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                        f.stream.seek(0)
-                        tmp.write(f.read())
-                        image_paths.append(tmp.name)
-                        temp_paths_to_cleanup.append(tmp.name)
-                messages = _inject_image_paths_into_messages(messages, image_paths)
-
-            # -------- Inference --------
-            vlm_output = vlm_generate(messages=messages, max_new_tokens=128)
-
-        for p in temp_paths_to_cleanup:
-            try:
-                os.remove(p)
-            except Exception:
-                pass
-
-        # Ensure JSON-friendly return shape
-        if is_batch and isinstance(vlm_output, list):
-            return jsonify({"response": vlm_output})
+        if media_type == "video":
+            _inject_video_path(convs, paths[0])
         else:
-            return jsonify(
-                {
-                    "response": vlm_output
-                    if isinstance(vlm_output, str)
-                    else (vlm_output[0] if vlm_output else "")
-                }
-            )
+            _inject_image_paths(convs, paths)
 
-    except Exception:
-        traceback.print_exc()
-        return jsonify({"error": traceback.format_exc()}), 500
+        if not _only_uploaded_media(convs, paths):
+            return jsonify({"error": "image/video items may only refer to the uploaded files"}), 400
+
+        try:
+            with lock:
+                outputs = vlm_generate(convs, max_new_tokens=128)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"error": f"inference failed ({type(e).__name__})"}), 500
+
+    return jsonify({"response": outputs if is_batch else outputs[0]})
 
 
 if __name__ == "__main__":
-    app.run(debug=False, host="0.0.0.0", port=17259)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("CRELERI_HOST", "127.0.0.1"),
+        help="interface to bind (default: $CRELERI_HOST or 127.0.0.1)",
+    )
+    parser.add_argument("--port", type=int, default=17259, help="port (default: %(default)s)")
+    parser.add_argument("--model", default=MODEL_ID, help="Hugging Face model id or local path")
+    parser.add_argument(
+        "--max-memory",
+        nargs="+",
+        default=MAX_MEMORY,
+        metavar="SIZE",
+        help=f"memory cap per GPU, in device order (default: {' '.join(MAX_MEMORY)})",
+    )
+    parser.add_argument(
+        "--attn-implementation",
+        default="flash_attention_2",
+        choices=["flash_attention_2", "sdpa", "eager"],
+        help="use sdpa when flash-attn is not installed (default: flash_attention_2)",
+    )
+    args = parser.parse_args()
+
+    load_model(args.model, dict(enumerate(args.max_memory)), args.attn_implementation)
+    app.run(host=args.host, port=args.port, debug=False)
