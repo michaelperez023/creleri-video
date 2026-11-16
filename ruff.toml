@@ -1,0 +1,33 @@
+target-version = "py310"
+line-length = 100
+
+# Third-party code vendored from upstream projects is linted upstream.
+extend-exclude = [
+    "adatad_temp_seg/opentad",
+    "dfine_obj_det/configs",
+    "dfine_obj_det/reference",
+    "dfine_obj_det/src",
+    "dfine_obj_det/tools/benchmark",
+    "dfine_obj_det/tools/dataset",
+    "dfine_obj_det/tools/deployment",
+    "dfine_obj_det/tools/visualization",
+    "dfine_obj_det/tools/inference/deepocsort.py",
+    "dfine_obj_det/tools/inference/onnx_inf.py",
+    "dfine_obj_det/tools/inference/strong_sort.py",
+    "dfine_obj_det/tools/inference/torch_inf.py",
+    "dfine_obj_det/tools/inference/trt_inf.py",
+    "dfine_obj_det/train.py",
+    "vlm_action_pipeline/grounded_sam_2",
+]
+
+[lint]
+select = ["E4", "E7", "E9", "F", "W", "I", "B", "UP", "S307", "S113", "S506", "PLE"]
+ignore = ["B905"]  # zip(strict=...) would change behavior on mismatched lengths
+
+[lint.per-file-ignores]
+# mmengine config files are plain assignments read by Config.fromfile
+"adatad_temp_seg/*-inference.py" = ["F821", "E501"]
+
+[format]
+# Configs copied from OpenTAD keep upstream formatting so they stay easy to diff.
+exclude = ["adatad_temp_seg/*-inference.py"]

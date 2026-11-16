@@ -7,7 +7,8 @@ vlm_parser = UFVLMParser(model_name=None)
 
 app = Flask(__name__)
 
-@app.route('/llama33', methods=['POST'])
+
+@app.route("/llama33", methods=["POST"])
 def llama33():
     try:
         data = request.get_json(silent=True)
@@ -21,9 +22,19 @@ def llama33():
         raw_constraints = data.get("constraint_words")
         constraint_words = None
         if raw_constraints is not None:
-            constraint_words = raw_constraints if isinstance(raw_constraints, list) else json.loads(raw_constraints)
+            constraint_words = (
+                raw_constraints
+                if isinstance(raw_constraints, list)
+                else json.loads(raw_constraints)
+            )
 
-        is_batch = str(data.get("is_batch", False)).strip().lower() in {"1", "true", "yes", "y", "on"}
+        is_batch = str(data.get("is_batch", False)).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
 
         # Ensure messages stays as JSON string for the parser (it handles both)
         if not isinstance(raw_messages, str):
@@ -50,5 +61,6 @@ def llama33():
         traceback.print_exc()
         return jsonify({"error": traceback.format_exc()}), 500
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     app.run(debug=False, host="0.0.0.0", port=5003)

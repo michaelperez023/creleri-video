@@ -7,7 +7,7 @@ models = {}
 
 def init(device_queue: multiprocessing.Queue, worker_ready):
     device = device_queue.get()
-    print('initializing worker process on device', device)
+    print("initializing worker process on device", device)
 
     models["sam_model"] = SAM2VideoPredictor.from_pretrained(
         "facebook/sam2-hiera-large", device=device

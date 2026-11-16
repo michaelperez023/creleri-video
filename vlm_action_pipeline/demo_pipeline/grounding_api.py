@@ -22,12 +22,12 @@ import json
 import traceback
 
 UPLOAD_ROOT = os.environ.get(
-    "GROUNDING_UPLOAD_DIR",
-    os.path.join(tempfile.gettempdir(), "grounding-uploads")
+    "GROUNDING_UPLOAD_DIR", os.path.join(tempfile.gettempdir(), "grounding-uploads")
 )
 pathlib.Path(UPLOAD_ROOT).mkdir(parents=True, exist_ok=True)
 
 CONTACT_REQUIRED_ACTIONS: set[str] = set()
+
 
 def load_contact_required_actions(path: str | None) -> set[str]:
     """
@@ -47,12 +47,16 @@ def load_contact_required_actions(path: str | None) -> set[str]:
         print(f"[grounding] contact-required file not found: {path} (continuing with empty set)")
     return actions
 
+
 def requires_contact(action: str) -> bool:
     return (action or "").strip().lower() in CONTACT_REQUIRED_ACTIONS
 
+
 def _write_upload_atomic(root_dir: str, suffix: str, data: bytes) -> str:
     file_id = uuid.uuid4().hex
-    final_path = os.path.join(root_dir, f"upload_{file_id}{suffix if suffix.startswith('.') else '.'+suffix}")
+    final_path = os.path.join(
+        root_dir, f"upload_{file_id}{suffix if suffix.startswith('.') else '.' + suffix}"
+    )
     tmp_path = final_path + ".part"
 
     with open(tmp_path, "wb") as f:
@@ -64,12 +68,14 @@ def _write_upload_atomic(root_dir: str, suffix: str, data: bytes) -> str:
     os.replace(tmp_path, final_path)
     return final_path
 
+
 def _wait_until_exists(path: str, tries: int = 5, delay: float = 0.05) -> bool:
     for _ in range(tries):
         if os.path.exists(path):
             return True
         time.sleep(delay)
     return False
+
 
 ground = None
 app = FastAPI()
@@ -80,6 +86,7 @@ result_time_to_live = 100
 THREAD_POOL = concurrent.futures.ThreadPoolExecutor(
     max_workers=max(2, min(8, (os.cpu_count() or 4)))  # tune as you like
 )
+
 
 def _build_artifacts(path, argument_masks, argument_names, action, contacts):
     t = -default_timer()
@@ -99,17 +106,21 @@ def _build_artifacts(path, argument_masks, argument_names, action, contacts):
     t += default_timer()
     return video_bytes, masks_bytes, t
 
+
 class SubjectObjectPair(BaseModel):
     argument_names: list[str]
     action: str
     caption: str
 
+
 class GroundingInputs(BaseModel):
     filename: str = ".mp4"
     subject_object_pairs: list[SubjectObjectPair]
 
+
 def validate_inputs(string):
     return GroundingInputs.model_validate_json(string)
+
 
 class JobStatus(Enum):
     PENDING = 0
@@ -117,6 +128,7 @@ class JobStatus(Enum):
     SUCCESS_INVALID = 2
     EXCEPTION = 3
     CANCELLED = 4
+
 
 @dataclass
 class Job:
@@ -128,6 +140,7 @@ class Job:
     extra_info: dict | None = None
     result_index: int | None = None
 
+
 class JobInfo(BaseModel):
     id: uuid.UUID
     status: JobStatus
@@ -138,14 +151,18 @@ class JobInfo(BaseModel):
     def serialize_status(self, status: JobStatus, _info):
         return status.name
 
+
 ongoing_jobs: dict[uuid.UUID, Job] = {}
+
 
 def validate_job_id(job_id: uuid.UUID) -> uuid.UUID:
     if job_id not in ongoing_jobs:
         raise HTTPException(404, f"Job {job_id} not found")
     return job_id
 
+
 JobID = Annotated[uuid.UUID, AfterValidator(validate_job_id)]
+
 
 def visualize_frame(frame, masks, colors, max_edge, text):
     long_edge = max(frame.shape[:2])
@@ -267,6 +284,7 @@ async def remove_old_results(older_than):
 def is_valid_argument_name(name):
     return name.lower() not in ("none", "unspecified", "unknown", "")
 
+
 async def do_grounding(video, inputs: GroundingInputs, jobs: list[Job]):
     global result_counter
     path = None
@@ -278,7 +296,7 @@ async def do_grounding(video, inputs: GroundingInputs, jobs: list[Job]):
             print(f"Upload write looks successful but file not found: {path}")
             raise RuntimeError("Upload write failed (path missing)")
 
-        print(f"Grounding on {path} (size={os.path.getsize(path)/1e6} MB)")
+        print(f"Grounding on {path} (size={os.path.getsize(path) / 1e6} MB)")
 
         validated_pairs = []
         for p in inputs.subject_object_pairs:
@@ -294,7 +312,7 @@ async def do_grounding(video, inputs: GroundingInputs, jobs: list[Job]):
 
         for i, _ in enumerate(inputs.subject_object_pairs):
             t0 = default_timer()
-            
+
             # Double-check existence before each heavy step (optional but helpful)
             if not os.path.exists(path):
                 print(f"Video file disappeared before processing job {i}: {path}")
@@ -309,7 +327,7 @@ async def do_grounding(video, inputs: GroundingInputs, jobs: list[Job]):
             try:
                 result, extra_info = await loop.run_in_executor(THREAD_POOL, _next_with_check)
             except Exception as e:
-                tb = ''.join(traceback.TracebackException.from_exception(e).format())
+                tb = "".join(traceback.TracebackException.from_exception(e).format())
                 failed_ids = []
                 for job in jobs[i:]:
                     job.status = JobStatus.EXCEPTION
@@ -348,8 +366,11 @@ async def do_grounding(video, inputs: GroundingInputs, jobs: list[Job]):
                     video_bytes, masks_bytes, viz_time = await loop.run_in_executor(
                         THREAD_POOL,
                         _build_artifacts,
-                        path, argument_masks, argument_names, action,
-                        contacts if need_contact else None
+                        path,
+                        argument_masks,
+                        argument_names,
+                        action,
+                        contacts if need_contact else None,
                     )
                     job.annotated_video = video_bytes
                     job.argument_masks = masks_bytes
@@ -358,13 +379,17 @@ async def do_grounding(video, inputs: GroundingInputs, jobs: list[Job]):
                     # no artifacts for invalid → has_visualization becomes False
                     job.annotated_video = None
                     job.argument_masks = None
-                    extra_info["rejection_reason"] = "contact-required action with no contact detected"
+                    extra_info["rejection_reason"] = (
+                        "contact-required action with no contact detected"
+                    )
 
-                extra_info.setdefault("contact_verification", {}).update({
-                    "requires_contact": need_contact,
-                    "detected_contact": bool(has_contact),
-                    "valid_under_policy": is_valid,
-                })
+                extra_info.setdefault("contact_verification", {}).update(
+                    {
+                        "requires_contact": need_contact,
+                        "detected_contact": bool(has_contact),
+                        "valid_under_policy": is_valid,
+                    }
+                )
 
             extra_info["subject_object_pair"] = inputs.subject_object_pairs[i]
             job.extra_info = extra_info
@@ -381,7 +406,7 @@ async def do_grounding(video, inputs: GroundingInputs, jobs: list[Job]):
                 os.remove(path)
             except FileNotFoundError:
                 pass
-            
+
 
 @app.post("/ground")
 async def ground_subject_object(
@@ -491,9 +516,9 @@ if __name__ == "__main__":
         "--contact-required-file",
         type=str,
         default="contact_required_actions.txt",
-        help="Path to a text file listing actions that require contact (one per line)."
+        help="Path to a text file listing actions that require contact (one per line).",
     )
-    
+
     args = parser.parse_args()
     result_time_to_live = args.result_ttl
 

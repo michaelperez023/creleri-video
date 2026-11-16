@@ -29,8 +29,10 @@ LLAMA_PORT = 5003
 OBJ_DET_PORT = 17266
 GROUNDING_PORT = 12000
 
-celery_app = Celery('tasks', broker=f'redis://localhost:{REDIS_PORT}/0', backend=f'redis://localhost:{REDIS_PORT}/0')
-    
+celery_app = Celery(
+    "tasks", broker=f"redis://localhost:{REDIS_PORT}/0", backend=f"redis://localhost:{REDIS_PORT}/0"
+)
+
 # Global variables for configuration, model, and device
 cfg = None
 model = None
@@ -38,16 +40,18 @@ device = None
 use_amp = None
 sentence_transformer_model = None
 
+
 def remove_module_prefix(state_dict):
     new_state_dict = {}
     for k, v in state_dict.items():
         # Remove 'module.' prefix
-        if k.startswith('module.'):
+        if k.startswith("module."):
             new_k = k[7:]  # len('module.') == 7
         else:
             new_k = k
         new_state_dict[new_k] = v
     return new_state_dict
+
 
 def initialize_globals(device_id):
     global cfg, model, device, use_amp, sentence_transformer_model, thumbnail_dir
@@ -73,10 +77,11 @@ def initialize_globals(device_id):
 
     # Initialize SentenceTransformer and AMP (automatic mixed precision)
     use_amp = getattr(cfg.solver, "amp", False)
-    sentence_transformer_model = SentenceTransformer('all-mpnet-base-v2')
+    sentence_transformer_model = SentenceTransformer("all-mpnet-base-v2")
 
     thumbnail_dir = "./thumbnails"
     os.makedirs(thumbnail_dir, exist_ok=True)
+
 
 def get_video_duration_decord(video_path):
     vr = decord.VideoReader(video_path)
@@ -85,31 +90,31 @@ def get_video_duration_decord(video_path):
     duration = num_frames / fps
     return duration
 
+
 def segments_overlap(seg1, seg2):
     """
     Returns True if segments overlap, False otherwise.
     """
     return max(seg1[0], seg2[0]) < min(seg1[1], seg2[1])
 
+
 def select_non_overlapping_proposals(proposals):
     # Sort proposals by score descending
-    proposals = sorted(proposals, key=lambda x: x['score'], reverse=True)
+    proposals = sorted(proposals, key=lambda x: x["score"], reverse=True)
     selected = []
     for prop in proposals:
         # Check if prop overlaps with any selected segment
         overlaps = False
         for sel in selected:
-            if segments_overlap(prop['segment'], sel['segment']):
+            if segments_overlap(prop["segment"], sel["segment"]):
                 overlaps = True
                 break
         if not overlaps:
             # Exclude the 'label' field if it exists
-            selected_prop = {
-                'segment': prop['segment'],
-                'score': prop['score']
-            }
+            selected_prop = {"segment": prop["segment"], "score": prop["score"]}
             selected.append(selected_prop)
     return selected
+
 
 def detect_transitions(video_path, threshold=30):
     cap = cv2.VideoCapture(video_path)
@@ -141,27 +146,28 @@ def detect_transitions(video_path, threshold=30):
     cap.release()
     return frame_transitions
 
+
 def adjust_segments_to_scene_changes(proposals, scene_changes, video_duration, min_duration=2):
     # Step 1: Create initial segments based on scene changes
     scene_changes = sorted(scene_changes)
     segments = []
     last_end = 0.0
-    
-    proposal_times = sorted([time for seg in proposals for time in seg['segment']])
+
+    proposal_times = sorted([time for seg in proposals for time in seg["segment"]])
 
     # Create segments between scene changes
     for sc in scene_changes:
-        segments.append({'segment': [last_end, sc], 'score': 0.0})
+        segments.append({"segment": [last_end, sc], "score": 0.0})
         last_end = sc
 
     # Add the final segment up to the video duration
     if last_end < video_duration:
-        segments.append({'segment': [last_end, video_duration], 'score': 0.0})
+        segments.append({"segment": [last_end, video_duration], "score": 0.0})
 
     # Step 2: For each initial segment, attempt to split based on proposals, enforcing min_duration
     final_segments = []
     for seg in segments:
-        start, end = seg['segment']
+        start, end = seg["segment"]
         split_points = [start]
 
         # Identify valid split points based on proposal times
@@ -175,21 +181,22 @@ def adjust_segments_to_scene_changes(proposals, scene_changes, video_duration, m
         for i in range(len(split_points) - 1):
             sub_start = split_points[i]
             sub_end = split_points[i + 1]
-            final_segments.append({'segment': [sub_start, sub_end], 'score': 0.0})
-            
+            final_segments.append({"segment": [sub_start, sub_end], "score": 0.0})
+
     return final_segments
+
 
 def segment_video(video_path):
     # Detect scene changes
     scene_changes = detect_transitions(video_path)
     print(f"Scene changes detected: {scene_changes}")
     video_duration = get_video_duration_decord(video_path)
-    
+
     # Get action segmentation predictions
     cfg.dataset.test = dict(
-        type='SingleVideoDataset',
+        type="SingleVideoDataset",
         video_path=video_path,
-        class_map='category_idx_51.txt',
+        class_map="category_idx_51.txt",
         pipeline=cfg.dataset.test.pipeline,
         feature_stride=4,
         sample_stride=1,
@@ -206,30 +213,25 @@ def segment_video(video_path):
         **cfg.solver.test,
     )
 
-    result = eval_one_epoch_single_video(
-        test_loader,
-        model,
-        cfg,
-        use_amp=use_amp,
-        device=device
-    )
+    result = eval_one_epoch_single_video(test_loader, model, cfg, use_amp=use_amp, device=device)
 
     final_proposals = {}
-    for video_id, proposals in result['results'].items():
+    for video_id, proposals in result["results"].items():
         # Filter and select non-overlapping proposals
         pre_nms_thresh = 0.001
-        proposals = [p for p in proposals if p['score'] > pre_nms_thresh]
-        proposals = sorted(proposals, key=lambda x: x['score'], reverse=True)[:2000]
+        proposals = [p for p in proposals if p["score"] > pre_nms_thresh]
+        proposals = sorted(proposals, key=lambda x: x["score"], reverse=True)[:2000]
         selected_proposals = select_non_overlapping_proposals(proposals)
         selected_proposals = selected_proposals[:20]  # Limit number of segments
 
         print(f"Selected proposals: {selected_proposals}")
-        
+
         final_proposals[video_id] = adjust_segments_to_scene_changes(
             selected_proposals, scene_changes, round(video_duration, 2), min_duration=1
         )
 
     return final_proposals
+
 
 def llm_parse_actions(reparsed_captions: list, action_list: list):
     url = f"http://localhost:{LLAMA_PORT}/llama33"
@@ -248,39 +250,48 @@ def llm_parse_actions(reparsed_captions: list, action_list: list):
         "• If there is any uncertainty, output: none\n"
         "• Do not invent labels. Choose from the set or 'none' only."
     )
-    
+
     for caption in reparsed_captions:
-        message_list.append([
-            {"role": "system", "content": SYSTEM_TMPL.format(actions=", ".join(actions_with_descriptions))},
-            {"role": "user", "content": (
-                "Caption:\n"
-                f"{caption}\n\n"
-                "Return exactly one label from the set above or 'none'."
-            )}
-        ])
-    '''for caption in reparsed_captions:
+        message_list.append(
+            [
+                {
+                    "role": "system",
+                    "content": SYSTEM_TMPL.format(actions=", ".join(actions_with_descriptions)),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Caption:\n"
+                        f"{caption}\n\n"
+                        "Return exactly one label from the set above or 'none'."
+                    ),
+                },
+            ]
+        )
+    """for caption in reparsed_captions:
         message_list.append([
             {"role": "system", "content": prompt.format(actions=", ".join(actions_with_descriptions))},
             {"role": "user",
              "content": "This is the caption describing the video:\n"
                         f"{caption}\n"
                         "Now, based on the caption, please select the action that best matches from the provided list."}
-        ])'''
+        ])"""
 
     payload = {
-        "messages": message_list,                            # <-- real JSON (list[list[turn]])
+        "messages": message_list,  # <-- real JSON (list[list[turn]])
         "constraint_words": [a[0] for a in action_list] + ["none"],  # <-- real JSON list
-        "is_batch": True
+        "is_batch": True,
     }
 
-    r = requests.post(url, json=payload, timeout=180)        # <-- send JSON
+    r = requests.post(url, json=payload, timeout=180)  # <-- send JSON
     r.raise_for_status()
     data = r.json()
 
     # Your server returns list[str] for batch; your old code expected dicts with ['content']
-    responses = data["response"]                             # list[str]
+    responses = data["response"]  # list[str]
     assert len(responses) == len(reparsed_captions)
     return responses
+
 
 def _coerce_json_obj(text: str) -> dict:
     """
@@ -314,6 +325,7 @@ def _coerce_json_obj(text: str) -> dict:
     # last resort
     return {"argument0": "none", "argument1": "none"}
 
+
 def llm_parse_arguments(parsed_actions, reparsed_captions, action_dict):
     url = f"http://localhost:{LLAMA_PORT}/llama33"
 
@@ -343,14 +355,16 @@ def llm_parse_arguments(parsed_actions, reparsed_captions, action_dict):
             "Return the JSON object now."
         )
 
-        message_list.append([
-            {"role": "system", "content": prompt},
-            {"role": "user",   "content": user},
-        ])
+        message_list.append(
+            [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": user},
+            ]
+        )
 
     # If no actionable items, return defaults aligned to captions
     if not message_list:
-        return [{"argument0":"none","argument1":"none"} for _ in reparsed_captions]
+        return [{"argument0": "none", "argument1": "none"} for _ in reparsed_captions]
 
     # --- SEND JSON, not form data ---
     payload = {"messages": message_list, "is_batch": True}
@@ -368,20 +382,24 @@ def llm_parse_arguments(parsed_actions, reparsed_captions, action_dict):
     idx = 0
     for act in parsed_actions:
         if act == "none":
-            final_answer.append({"argument0":"none","argument1":"none"})
+            final_answer.append({"argument0": "none", "argument1": "none"})
         else:
             # pop next parsed object
-            final_answer.append(parsed_from_model[idx] if idx < len(parsed_from_model)
-                                else {"argument0":"none","argument1":"none"})
+            final_answer.append(
+                parsed_from_model[idx]
+                if idx < len(parsed_from_model)
+                else {"argument0": "none", "argument1": "none"}
+            )
             idx += 1
 
     assert len(final_answer) == len(reparsed_captions)
     return final_answer
 
+
 def filter_caption(objs: list, vlm_captions: list):
     filtered_captions = []
-    #print(f"Caption before filter: {vlm_captions}")
-    url = f'http://localhost:{LLAMA_PORT}/llama33'
+    # print(f"Caption before filter: {vlm_captions}")
+    url = f"http://localhost:{LLAMA_PORT}/llama33"
     messages_list = []
     indices_mapping = {}  # To keep track of indices
     idx_counter = 0
@@ -397,34 +415,31 @@ def filter_caption(objs: list, vlm_captions: list):
                 f"Filter the caption to retain only elements directly related to '{obj}', including any interactions, actions, or contexts involving '{obj}'. "
                 f"This includes details about entities interacting with '{obj}', actions '{obj}' performs or receives, and the setting where '{obj}' is present. "
                 f"If there is no information relevant to '{obj}', respond with 'None'. "
-                f"Respond in JSON format only as {{\"{obj}\": \"filtered caption\"}}. Do not include any other sentences."
+                f'Respond in JSON format only as {{"{obj}": "filtered caption"}}. Do not include any other sentences.'
             )
             message = [
-                {
-                    "role": "system",
-                    "content": prompt
-                },
+                {"role": "system", "content": prompt},
                 {
                     "role": "user",
-                    "content": f"Here is the caption: '{caption}'. Please ensure the response includes all relevant information involving '{obj}', including interactions, actions, and contextual settings related to '{obj}'."
-                }
+                    "content": f"Here is the caption: '{caption}'. Please ensure the response includes all relevant information involving '{obj}', including interactions, actions, and contextual settings related to '{obj}'.",
+                },
             ]
             messages_list.append(message)
             indices_mapping[idx_counter] = (idx, obj)
             idx_counter += 1
-            #print("\nmessage: \n")
-            #print(str(message))
-    data = {'messages': messages_list,'is_batch': True}
+            # print("\nmessage: \n")
+            # print(str(message))
+    data = {"messages": messages_list, "is_batch": True}
     retry_times = 0
-    
+
     while retry_times < 3:
-        try: 
+        try:
             response = requests.post(url, json=data)
-            response_contents = response.json()['response']
+            response_contents = response.json()["response"]
             if len(response_contents) == len(messages_list):
                 for idx, response_content in enumerate(response_contents):
                     caption_idx, obj = indices_mapping[idx]
-                    content = response_content['content']
+                    content = response_content["content"]
                     try:
                         filtered_caption = json.loads(content)[obj]
                         filtered_captions.append(filtered_caption)
@@ -432,9 +447,9 @@ def filter_caption(objs: list, vlm_captions: list):
                         raise ValueError("Failed to parse response.")
             else:
                 raise ValueError("Response length mismatch.")
-            
+
             break
-  
+
         except Exception as e:
             filtered_captions = []
             retry_times += 1
@@ -444,6 +459,7 @@ def filter_caption(objs: list, vlm_captions: list):
         filtered_captions = [caption for captions in vlm_captions for caption in captions]
 
     return filtered_captions
+
 
 def group_predictions_with_dbscan(arguments: list, actions: list, eps=0.3, min_samples=1):
     """
@@ -467,41 +483,41 @@ def group_predictions_with_dbscan(arguments: list, actions: list, eps=0.3, min_s
 
     # Apply substitutions to avoid 'none' as argument values
     for entry in filtered_predictions:
-        arguments = entry['arguments']
+        arguments = entry["arguments"]
         # First Substitution
-        if arguments.get('argument1') == 'none' and arguments.get('argument2', 'none') != 'none':
-            arguments['argument1'] = arguments.get('argument2')
-            arguments.pop('argument2', None)
+        if arguments.get("argument1") == "none" and arguments.get("argument2", "none") != "none":
+            arguments["argument1"] = arguments.get("argument2")
+            arguments.pop("argument2", None)
 
         # Second Substitution
-        if arguments.get('argument1') == 'none':
-            arguments.pop('argument1', None)
+        if arguments.get("argument1") == "none":
+            arguments.pop("argument1", None)
 
         # Third Substitution
-        if arguments.get('argument0') == 'none':
-            arguments.pop('argument0', None)
+        if arguments.get("argument0") == "none":
+            arguments.pop("argument0", None)
 
         # Remove any remaining arguments with 'none' as value
-        arguments = {k: v for k, v in arguments.items() if v != 'none'}
+        arguments = {k: v for k, v in arguments.items() if v != "none"}
 
         # Update the entry's arguments
-        entry['arguments'] = arguments
+        entry["arguments"] = arguments
 
     # Convert each action/argument pair to a string format for embedding
     pair_texts = []
     for entry in filtered_predictions:
-        action = entry['action']
-        arguments = entry['arguments']
+        action = entry["action"]
+        arguments = entry["arguments"]
 
         # Access argument0 without removing it
-        argument0 = arguments.get('argument0', None)
+        argument0 = arguments.get("argument0", None)
 
         # Get the remaining arguments without argument0
-        other_arguments = [v for k, v in arguments.items() if k != 'argument0']
+        other_arguments = [v for k, v in arguments.items() if k != "argument0"]
 
         # Build the components list
         components = ([argument0] if argument0 else []) + [action] + other_arguments
-        text = ' '.join(components)
+        text = " ".join(components)
         pair_texts.append(text)
 
     print("Pair Texts for Embedding:")
@@ -519,7 +535,7 @@ def group_predictions_with_dbscan(arguments: list, actions: list, eps=0.3, min_s
     distance_matrix = np.clip(distance_matrix, 0, None)
 
     # Use DBSCAN with the precomputed distance matrix
-    clustering = DBSCAN(eps=eps, min_samples=min_samples, metric='precomputed')
+    clustering = DBSCAN(eps=eps, min_samples=min_samples, metric="precomputed")
     labels = clustering.fit_predict(distance_matrix)
 
     clusters_dict = {}
@@ -545,12 +561,11 @@ def group_predictions_with_dbscan(arguments: list, actions: list, eps=0.3, min_s
 
     return cluster_representatives, filtered_predictions
 
+
 def object_detection(video_path):
     url = f"http://localhost:{OBJ_DET_PORT}/process_video"
 
-    data = {
-        'video_path': video_path
-    }
+    data = {"video_path": video_path}
 
     try:
         response = requests.post(url, json=data)
@@ -559,7 +574,7 @@ def object_detection(video_path):
             return (
                 response_data.get("objects", []),
                 response_data.get("captions", []),
-                response_data.get("videos", [])
+                response_data.get("videos", []),
             )
         else:
             print(f"Error {response.status_code}: {response.text}")
@@ -567,10 +582,12 @@ def object_detection(video_path):
     except Exception as e:
         print(f"Request error: {e}")
         return ([], [], [])
-    
+
+
 def _norm_cap(s):
     s = (s or "").strip()
     return "no action" if s.lower() in {"none", "none."} else s
+
 
 def proc_one_video(video_path: str, action_list: list, action_dict: dict):
     objects, vlm_captions, videos = object_detection(video_path)
@@ -605,10 +622,12 @@ def proc_one_video(video_path: str, action_list: list, action_dict: dict):
 
     parsed_actions = llm_parse_actions(vlm_captions_expanded, action_list)
     print(f"Parsed actions: {parsed_actions}")
-    parsed_arguments = llm_parse_arguments(parsed_actions,vlm_captions_expanded,action_dict)
+    parsed_arguments = llm_parse_arguments(parsed_actions, vlm_captions_expanded, action_dict)
     print(f"Parsed arguments: {parsed_arguments}")
     assert len(parsed_arguments) == len(parsed_actions) == len(vlm_captions_expanded)
-    grouped_predictions_and_reps, filtered_predictions = group_predictions_with_dbscan(parsed_arguments, parsed_actions)
+    grouped_predictions_and_reps, filtered_predictions = group_predictions_with_dbscan(
+        parsed_arguments, parsed_actions
+    )
 
     if not filtered_predictions:
         print("No valid actions detected. Skipping clustering.")
@@ -623,17 +642,16 @@ def proc_one_video(video_path: str, action_list: list, action_dict: dict):
         probability = cluster_size / total_valid if total_valid > 0 else 0
 
         representative_entry = filtered_predictions[representative_filtered_idx]
-        representative_original_idx = representative_entry['original_idx']
+        representative_original_idx = representative_entry["original_idx"]
 
         # Get original indices for printing
-        indices_original = [filtered_predictions[idx]['original_idx'] for idx in indices]
-        print(f"Label: {label}, Original Indices: {indices_original}, Representative original idx: {representative_original_idx}")
+        indices_original = [filtered_predictions[idx]["original_idx"] for idx in indices]
+        print(
+            f"Label: {label}, Original Indices: {indices_original}, Representative original idx: {representative_original_idx}"
+        )
 
         # Build the pattern
-        pattern = {
-            "action": representative_entry["action"],
-            **representative_entry["arguments"]
-        }
+        pattern = {"action": representative_entry["action"], **representative_entry["arguments"]}
 
         # Determine the number of arguments in the pattern (excluding 'action')
         num_arguments = len(pattern) - 1  # Subtract 1 for the 'action' key
@@ -647,14 +665,12 @@ def proc_one_video(video_path: str, action_list: list, action_dict: dict):
         if key not in predictions:
             predictions[key] = []
 
-        predictions[key].append({
-            "pattern": pattern,
-            "probability": probability,
-            "caption": caption
-        })
+        predictions[key].append(
+            {"pattern": pattern, "probability": probability, "caption": caption}
+        )
 
     # After populating 'predictions', sort the keys
-    sorted_keys = sorted(predictions.keys(), key=lambda x: int(x.split('_')[-1]))
+    sorted_keys = sorted(predictions.keys(), key=lambda x: int(x.split("_")[-1]))
 
     # Build final_predictions with sorted keys
     final_predictions = OrderedDict()
@@ -663,20 +679,32 @@ def proc_one_video(video_path: str, action_list: list, action_dict: dict):
 
     return final_predictions
 
-def get_subj_obj_act_from_segments(segmentation_result, video_file_path):    
+
+def get_subj_obj_act_from_segments(segmentation_result, video_file_path):
     action_df = pd.read_csv("./action_categories.csv")
-    action_list_v2 = list(zip(action_df['action_name'], action_df['"as in…"'], action_df['example sentence from propbank']))    
-    action_dict = {row['action_name']: (row['"as in…"'], row['example sentence from propbank']) for index, row in action_df.iterrows()}
+    action_list_v2 = list(
+        zip(
+            action_df["action_name"],
+            action_df['"as in…"'],
+            action_df["example sentence from propbank"],
+        )
+    )
+    action_dict = {
+        row["action_name"]: (row['"as in…"'], row["example sentence from propbank"])
+        for index, row in action_df.iterrows()
+    }
 
     all_results = []
     # Iterate over each segment and send it to the object detection API
     for video_id, segments in segmentation_result.items():
         video_basename = os.path.basename(video_id)
         for idx, segment in enumerate(segments):
-            start_time, end_time = segment['segment']
-            
+            start_time, end_time = segment["segment"]
+
             # Extract the specific segment from the video
-            temp_video_path = os.path.join('./', f'segment_{datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")}.mp4')
+            temp_video_path = os.path.join(
+                "./", f"segment_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}.mp4"
+            )
 
             vr = decord.VideoReader(video_file_path, ctx=decord.cpu())
             fps = vr.get_avg_fps()
@@ -689,7 +717,9 @@ def get_subj_obj_act_from_segments(segmentation_result, video_file_path):
             start_frame = max(0, start_frame)
             end_frame = min(total_frames, end_frame)
             if start_frame >= end_frame:
-                print(f"Adjusted start_frame ({start_frame}) is not less than end_frame ({end_frame}). Skipping segment.")
+                print(
+                    f"Adjusted start_frame ({start_frame}) is not less than end_frame ({end_frame}). Skipping segment."
+                )
                 continue
 
             frames = vr.get_batch(range(start_frame, end_frame)).asnumpy()
@@ -702,11 +732,11 @@ def get_subj_obj_act_from_segments(segmentation_result, video_file_path):
             cv2.imwrite(thumbnail_path, cv2.cvtColor(first_frame, cv2.COLOR_RGB2BGR))
 
             # Include the thumbnail filename in your results
-            segment['thumbnail'] = thumbnail_filename
+            segment["thumbnail"] = thumbnail_filename
 
             # Convert frames to video using OpenCV
             height, width, _ = frames[0].shape
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             out = cv2.VideoWriter(temp_video_path, fourcc, fps, (width, height))
             for frame in frames:
                 out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
@@ -716,9 +746,11 @@ def get_subj_obj_act_from_segments(segmentation_result, video_file_path):
             print(f"Segment saved at: {temp_video_path}")
             for _ in range(3):
                 try:
-                    results = proc_one_video(                                 video_path=os.path.abspath(temp_video_path), 
-                        action_list=action_list_v2, 
-                        action_dict=action_dict)
+                    results = proc_one_video(
+                        video_path=os.path.abspath(temp_video_path),
+                        action_list=action_list_v2,
+                        action_dict=action_dict,
+                    )
                     print(f"Results: {results}")
                     break
                 except Exception as e:
@@ -728,35 +760,33 @@ def get_subj_obj_act_from_segments(segmentation_result, video_file_path):
             subject_object_pairs = []
             for key in results:
                 for item in results[key]:
-                    pattern = item['pattern']
-                    caption = item['caption']
-                    action = pattern.get('action', 'none')
-                    arg0 = pattern.get('argument0', 'none')
-                    arg1 = pattern.get('argument1', 'none')
-                    arg2 = pattern.get('argument2', 'none')
+                    pattern = item["pattern"]
+                    caption = item["caption"]
+                    action = pattern.get("action", "none")
+                    arg0 = pattern.get("argument0", "none")
+                    arg1 = pattern.get("argument1", "none")
+                    arg2 = pattern.get("argument2", "none")
 
                     # Build the argument names list
                     argument_names = []
-                    if arg0 != 'none':
+                    if arg0 != "none":
                         argument_names.append(arg0)
-                    if arg1 != 'none':
+                    if arg1 != "none":
                         argument_names.append(arg1)
-                    if arg2 != 'none':
+                    if arg2 != "none":
                         argument_names.append(arg2)
 
-                    caption = caption if caption else ''
+                    caption = caption if caption else ""
 
                     # Append the dictionary to the list
-                    subject_object_pairs.append({
-                        'argument_names': argument_names,
-                        'action': action,
-                        'caption': caption
-                    })
+                    subject_object_pairs.append(
+                        {"argument_names": argument_names, "action": action, "caption": caption}
+                    )
 
             inputs = {
                 "subject_object_pairs": subject_object_pairs,
             }
-            
+
             url = f"http://localhost:{GROUNDING_PORT}"
             with open(temp_video_path, "rb") as file:
                 response = requests.post(
@@ -765,71 +795,79 @@ def get_subj_obj_act_from_segments(segmentation_result, video_file_path):
                 response.raise_for_status()
             print(response.json())
 
-            all_results.append({
-                "results": results,
-                "api_response": response.json(),
-                "thumbnail": thumbnail_filename,
-                "segment": segment  # Include segment info if needed
-            })
+            all_results.append(
+                {
+                    "results": results,
+                    "api_response": response.json(),
+                    "thumbnail": thumbnail_filename,
+                    "segment": segment,  # Include segment info if needed
+                }
+            )
 
             # Clean up the temporary file
             os.remove(temp_video_path)
 
     return all_results
-    
+
+
 def get_video_duration_ffmpeg(filepath):
     probe = ffmpeg.probe(filepath)
-    duration = float(probe['format']['duration'])
+    duration = float(probe["format"]["duration"])
     return duration
+
 
 def generate_intervals(duration, interval_length=5):
     intervals = []
     start = 0.0
-    
+
     while start < duration:
         end = min(start + interval_length, duration)
         intervals.append({"segment": [start, end], "score": 1})
         start = end  # Move to the next segment
-    
+
     return intervals
+
 
 @celery_app.task(name="tasks.process_video_task")
 def process_video_task(file_path, segmentation_type):
     duration = get_video_duration_ffmpeg(file_path)
     print(f"Video duration: {duration} seconds")
-    
+
     # Segment the video and generate proposals
-    if segmentation_type == 2: # no segmentation
-        proposals = {file_path: [{'segment': [0, duration], 'score': 1}]}
-    elif segmentation_type == 1: # uniform segmentation
+    if segmentation_type == 2:  # no segmentation
+        proposals = {file_path: [{"segment": [0, duration], "score": 1}]}
+    elif segmentation_type == 1:  # uniform segmentation
         proposals = {file_path: generate_intervals(duration)}
-    elif segmentation_type == 0: # segmentation model
+    elif segmentation_type == 0:  # segmentation model
         proposals = segment_video(file_path)
     print(f"Proposals: {proposals}")
-    
+
     results = get_subj_obj_act_from_segments(proposals, file_path)
 
     # Collect the thumbnails and segments
     thumbnails = []
     for item in results:
-        thumbnail = item.get('thumbnail')
-        segment_info = item.get('segment')
-        thumbnails.append({
-            "thumbnail": thumbnail,
-            "segment": segment_info['segment']  # Start and end times
-        })
+        thumbnail = item.get("thumbnail")
+        segment_info = item.get("segment")
+        thumbnails.append(
+            {
+                "thumbnail": thumbnail,
+                "segment": segment_info["segment"],  # Start and end times
+            }
+        )
 
     os.remove(file_path)
 
     print(f"Thumbnails: {thumbnails}")
     return {"proposals": proposals, "results": results, "thumbnails": thumbnails}
 
+
 if __name__ == "__main__":
     celery_app.conf.update(
         worker_hijack_root_logger=False,
         worker_redirect_stdouts=False,
     )
-    
+
     for name in ["celery", "celery.worker", "celery.app.trace", "celery.redirected"]:
         celery_logger = logging.getLogger(name)
         coloredlogs.install(
@@ -837,11 +875,11 @@ if __name__ == "__main__":
             logger=celery_logger,
             fmt="%(asctime)s [%(levelname)s] %(message)s",
             level_styles={
-                'debug':    {'color': 'black'},
-                'info':     {'color': 'black'},
-                'warning':  {'color': 'black', 'bold': True},
-                'error':    {'color': 'black', 'bold': True, 'bright': True},
-                'critical': {'color': 'black', 'bold': True, 'bright': True},
+                "debug": {"color": "black"},
+                "info": {"color": "black"},
+                "warning": {"color": "black", "bold": True},
+                "error": {"color": "black", "bold": True, "bright": True},
+                "critical": {"color": "black", "bold": True, "bright": True},
             },
         )
 
@@ -855,4 +893,4 @@ if __name__ == "__main__":
     initialize_globals(device_id)
 
     # Start the Celery worker
-    celery_app.worker_main(['worker', '--loglevel=info', '--pool=solo'])
+    celery_app.worker_main(["worker", "--loglevel=info", "--pool=solo"])

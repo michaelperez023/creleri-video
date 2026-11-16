@@ -37,6 +37,7 @@ os.environ.setdefault("TQDM_DISABLE", "1")
 CACHE_ROOT = pathlib.Path("/tmp/sam2_cache")  # node-local
 CACHE_ROOT.mkdir(exist_ok=True, parents=True)
 
+
 def _video_hash(path):
     h = hashlib.sha1()
     # fast but decent: hash container + size + mtime; or hash first/last 1MB
@@ -44,11 +45,12 @@ def _video_hash(path):
     h.update(f"{path}:{st.st_size}:{int(st.st_mtime)}".encode())
     return h.hexdigest()
 
+
 def ensure_jpeg_dir(mp4_path, long_edge=1280):
     vid_hash = _video_hash(mp4_path)
     out_dir = CACHE_ROOT / vid_hash
     marker = out_dir / "done.json"
-    lock   = out_dir / ".lock"
+    lock = out_dir / ".lock"
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -97,13 +99,13 @@ def ensure_jpeg_dir(mp4_path, long_edge=1280):
             except FileNotFoundError:
                 pass
 
+
 # Fix to get GroundingDINO to build correctly
 conda_prefix = os.environ.get("CONDA_PREFIX")
 if conda_prefix is not None and "CUDA_HOME" not in os.environ:
     os.environ["CUDA_HOME"] = conda_prefix
-    os.environ["CUDA_INC_PATH"] = os.path.join(
-        conda_prefix, "targets/x86_64-linux/include"
-    )
+    os.environ["CUDA_INC_PATH"] = os.path.join(conda_prefix, "targets/x86_64-linux/include")
+
 
 @dataclass
 class Result:
@@ -111,13 +113,12 @@ class Result:
     exception: Exception | None = None
     result: Any = None
 
+
 @njit(
     "(boolean[:, :], boolean[:, :], float32[:, :], boolean[:, :],  int32, float32)",
     nogil=True,
 )
-def _find_contact_impl(
-    subject_mask, object_mask, depth, contact, radius, depth_threshold
-):
+def _find_contact_impl(subject_mask, object_mask, depth, contact, radius, depth_threshold):
     for x in range(subject_mask.shape[0]):
         for y in range(subject_mask.shape[1]):
             if not subject_mask[x, y] or contact[x, y]:
@@ -138,9 +139,7 @@ def _find_contact_impl(
                         contact[i, j] = True
 
 
-def has_small_holes_and_islands(
-    mask, small_hole_area_divider, small_hole_area_threshold, n_frames
-):
+def has_small_holes_and_islands(mask, small_hole_area_divider, small_hole_area_threshold, n_frames):
     """
     Sample `self.small_hole_n_frames` frames of the mask and check if it has
     too many small holes or islands.
@@ -174,8 +173,9 @@ def molmo_inference(args):
     inputs = {k: v.to(model.device).unsqueeze(0) for k, v in inputs.items()}
 
     # generate output; maximum 200 new tokens; stop generation when <|endoftext|> is generated
-    with torch.inference_mode(), torch.autocast(
-        device_type="cuda", enabled=True, dtype=torch.bfloat16
+    with (
+        torch.inference_mode(),
+        torch.autocast(device_type="cuda", enabled=True, dtype=torch.bfloat16),
     ):
         output = model.generate_from_batch(
             inputs,
@@ -185,10 +185,9 @@ def molmo_inference(args):
 
     # only get generated tokens; decode them to text
     generated_tokens = output[0, inputs["input_ids"].size(1) :]
-    generated_text = processor.tokenizer.decode(
-        generated_tokens, skip_special_tokens=True
-    )
+    generated_text = processor.tokenizer.decode(generated_tokens, skip_special_tokens=True)
     return generated_text
+
 
 def _quiet_kwargs(f):
     # Add any commonly-seen flags across versions
@@ -204,9 +203,11 @@ def _quiet_kwargs(f):
             kw[k] = v
     return kw
 
+
 def _init_state_compat(pred, video_dir):
     f = pred.init_state
     return f(video_dir, **_quiet_kwargs(f))
+
 
 def _propagate_compat(pred, st, *, reverse=False):
     f = pred.propagate_in_video
@@ -215,9 +216,8 @@ def _propagate_compat(pred, st, *, reverse=False):
         kw["reverse"] = reverse
     return f(st, **kw)
 
-def track_items(
-    args: tuple[str, list[tuple[int, dict]], int, int, float, int]
-):
+
+def track_items(args: tuple[str, list[tuple[int, dict]], int, int, float, int]):
     (
         video,
         detections,
@@ -229,7 +229,7 @@ def track_items(
     predictor = grounding_mp.models["sam_model"]
 
     detections_per_frame = defaultdict(list)
-    for frame_idx, det in detections:          # det is a dict from GroundingDINO
+    for frame_idx, det in detections:  # det is a dict from GroundingDINO
         detections_per_frame[frame_idx].append(det)
 
     item_masks = defaultdict(list)
@@ -274,10 +274,13 @@ def track_items(
                 predictor.add_new_points_or_box(state, frame_idx=frame_idx, obj_id=i, box=box)
 
             # DO NOT re-init here — just propagate on the current state
-            forward  = _propagate_compat(predictor, state, reverse=False)
+            forward = _propagate_compat(predictor, state, reverse=False)
             backward = _propagate_compat(predictor, state, reverse=True)
-            backward = (out for out in backward
-                        if isinstance(out, (list, tuple)) and out and out[0] != frame_idx)
+            backward = (
+                out
+                for out in backward
+                if isinstance(out, (list, tuple)) and out and out[0] != frame_idx
+            )
             results = itertools.chain(forward, backward)
 
             segments = [list() for _ in dets]
@@ -323,7 +326,7 @@ class SubjectObjectGrounding:
         mask_video_mask_edge: int = 1280,
         mask_video_target_fps: int = 10,
         mask_video_max_frames: int = 10,
-        max_mask_pairs_to_check: int = 10
+        max_mask_pairs_to_check: int = 10,
     ) -> None:
         self.grounding_threshold = grounding_threshold
         self.grounding_n_frames = grounding_n_frames
@@ -396,7 +399,7 @@ class SubjectObjectGrounding:
     def sample_indices(total, n_samples):
         n_samples = min(total, n_samples)
         return np.linspace(0, total - 1, n_samples, dtype=np.int64)
-    
+
     @staticmethod
     def load_frames(video, n_frames):
         vr = VideoReader(video)
@@ -404,17 +407,21 @@ class SubjectObjectGrounding:
         indices = SubjectObjectGrounding.sample_indices(total, n_frames)
         frames = [Image.fromarray(vr[int(i)].asnumpy()) for i in indices]
         return frames, indices
-    
+
     def _llama_rewrite_point_to_prompts(self, item_and_captions):
         url = f"http://localhost:{LLAMA_PORT}/llama33"
         msgs = []
         for item, caption in item_and_captions:
-            msgs.append([
-                {"role":"system","content":
-                 "Rewrite into one short imperative that starts with 'Point to' and mentions the given item; "
-                 "optionally include a few relevant words from the context. Output one line only."},
-                {"role":"user","content": f'item="{item}"\ncontext="{caption}"'}
-            ])
+            msgs.append(
+                [
+                    {
+                        "role": "system",
+                        "content": "Rewrite into one short imperative that starts with 'Point to' and mentions the given item; "
+                        "optionally include a few relevant words from the context. Output one line only.",
+                    },
+                    {"role": "user", "content": f'item="{item}"\ncontext="{caption}"'},
+                ]
+            )
         payload = {"messages": msgs, "is_batch": True}
         r = requests.post(url, json=payload, timeout=60)
         r.raise_for_status()
@@ -440,7 +447,7 @@ class SubjectObjectGrounding:
                 if len(attrs) % 2 != 0:
                     return []
                 for i in range(len(attrs) // 2):
-                    points.append((attrs[f"x{i+1}"], attrs[f"y{i+1}"]))
+                    points.append((attrs[f"x{i + 1}"], attrs[f"y{i + 1}"]))
         except KeyError:
             return []
 
@@ -493,10 +500,7 @@ class SubjectObjectGrounding:
             for (name, _), prompt in zip(item_and_captions, prompts):
                 inputs.append((frame, prompt, frame_index, name))
 
-        args = [
-            (torch.as_tensor(np.array(frame)), prompt, {})
-            for frame, prompt, _, _ in inputs
-        ]
+        args = [(torch.as_tensor(np.array(frame)), prompt, {}) for frame, prompt, _, _ in inputs]
         results = self.pool.imap(molmo_inference, args)
 
         detections = []
@@ -598,10 +602,7 @@ class SubjectObjectGrounding:
             if resized_mask.sum() == 0.0:
                 continue
             for existing_mask, _, _ in unique_masks:
-                if (
-                    self.iou(resized_mask, existing_mask)
-                    > self.deduplicate_iou_threshold
-                ):
+                if self.iou(resized_mask, existing_mask) > self.deduplicate_iou_threshold:
                     break
             else:
                 unique_masks.append((resized_mask, mask, score))
@@ -757,9 +758,7 @@ class SubjectObjectGrounding:
         grounding_molmo_time += default_timer()
         extra_info["grounding_molmo_time"] = grounding_molmo_time
 
-        detections = self.merge_detections(
-            dino_detections, molmo_detections, dino_frames[0].size
-        )
+        detections = self.merge_detections(dino_detections, molmo_detections, dino_frames[0].size)
 
         detected_arguments = set(detection["label"] for _, detection in detections)
         missing = list(set(argument_names) - detected_arguments)
@@ -776,18 +775,14 @@ class SubjectObjectGrounding:
 
         missing = list(set(argument_names) - set(item_masks.keys()))
         if missing:
-            extra_info["rejection_reason"] = (
-                f"{missing!r} in {caption!r} not found in tracking"
-            )
+            extra_info["rejection_reason"] = f"{missing!r} in {caption!r} not found in tracking"
             return None, extra_info
 
         masks_with_scores = self._score_masks(item_masks, molmo_detections)
 
         prepare_candidate_time = -default_timer()
         candidates = []
-        for combination in itertools.product(
-            *(masks_with_scores[name] for name in argument_names)
-        ):
+        for combination in itertools.product(*(masks_with_scores[name] for name in argument_names)):
             masks, molmo_scores, dino_scores = zip(*combination)
             # If the mask of one argument is almost the same as another
             for i, mask_a in enumerate(masks):
@@ -802,9 +797,7 @@ class SubjectObjectGrounding:
         extra_info["prepare_candidate_time"] = prepare_candidate_time
 
         if not candidates:
-            extra_info["rejection_reason"] = (
-                "can't find valid combination of argument masks"
-            )
+            extra_info["rejection_reason"] = "can't find valid combination of argument masks"
             return None, extra_info
 
         contact_time = -default_timer()
@@ -812,9 +805,7 @@ class SubjectObjectGrounding:
         best_contacts = None
         has_contact = False
         for masks, _, _ in candidates:
-            has_contact, contacts = self._check_argument_contact(
-                depth_estimations, masks
-            )
+            has_contact, contacts = self._check_argument_contact(depth_estimations, masks)
             if has_contact:
                 best_mask = masks
                 best_contacts = contacts
@@ -859,8 +850,8 @@ class SubjectObjectGrounding:
         unique_arguments = sorted(unique_arguments)
 
         shared_grounding_dino_time = -default_timer()
-        dino_detections, dino_frames, dino_frame_indices = (
-            self.ground_items_grounding_dino(video, unique_arguments)
+        dino_detections, dino_frames, dino_frame_indices = self.ground_items_grounding_dino(
+            video, unique_arguments
         )
         shared_grounding_dino_time += default_timer()
         extra_info["shared_grounding_dino_time"] = shared_grounding_dino_time

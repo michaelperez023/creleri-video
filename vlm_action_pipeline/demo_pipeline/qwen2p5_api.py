@@ -16,30 +16,30 @@ lock = threading.Lock()
 
 MODEL_ID = "Qwen/Qwen2.5-VL-32B-Instruct"
 max_mem = {0: "1GiB", 1: "140GiB", 2: "140GiB", 3: "140GiB"}
-#max_mem = {0: "1GiB", 1: "210GiB", 2: "210GiB"}
-#model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-#    "Qwen/Qwen2.5-VL-32B-Instruct", 
-#    dtype="auto", 
+# max_mem = {0: "1GiB", 1: "210GiB", 2: "210GiB"}
+# model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+#    "Qwen/Qwen2.5-VL-32B-Instruct",
+#    dtype="auto",
 #    device_map="auto",
 #    max_memory=max_mem
-#)
+# )
 
 # We recommend enabling flash_attention_2 for better acceleration and memory saving, especially in multi-image and video scenarios.
 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-     "Qwen/Qwen2.5-VL-32B-Instruct",
-     dtype=torch.bfloat16,
-     attn_implementation="flash_attention_2",
-     device_map="auto",
-     max_memory=max_mem
+    "Qwen/Qwen2.5-VL-32B-Instruct",
+    dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2",
+    device_map="auto",
+    max_memory=max_mem,
 )
 
 processor = AutoProcessor.from_pretrained(MODEL_ID)
 
 tok = processor.tokenizer
-tok.padding_side = "left"   
+tok.padding_side = "left"
 
 if tok.pad_token_id is None:
-    tok.pad_token = tok.eos_token       # safe default
+    tok.pad_token = tok.eos_token  # safe default
 
 # keep model configs in sync (helps generate/beam code paths)
 model.config.pad_token_id = tok.pad_token_id
@@ -50,6 +50,7 @@ tok.truncation_side = "left"
 
 app = Flask(__name__)
 
+
 def _parse_bool(val):
     if isinstance(val, bool):
         return val
@@ -58,8 +59,10 @@ def _parse_bool(val):
     s = str(val).strip().lower()
     return s in {"1", "true", "yes", "y", "on"}
 
+
 def _ensure_list(x):
     return x if isinstance(x, list) else [x]
+
 
 def _save_uploaded_image_files(image_files):
     """
@@ -74,6 +77,7 @@ def _save_uploaded_image_files(image_files):
                 tmp.write(file_storage.read())
             temp_paths.append("file://" + tmp.name)
     return temp_paths
+
 
 def _inject_image_paths_into_messages(messages, image_paths):
     """
@@ -122,8 +126,10 @@ def _inject_image_paths_into_messages(messages, image_paths):
 
     return messages
 
+
 def _inject_video_path_into_messages(messages, path):
     """Replace any 'video' entries with a *plain* local path."""
+
     def patch_conv(conv):
         for turn in conv:
             for part in turn.get("content", []):
@@ -135,8 +141,10 @@ def _inject_video_path_into_messages(messages, path):
         return [patch_conv(conv) for conv in messages]  # batch
     return patch_conv(messages)  # single
 
+
 def _is_single_conv(msgs):
     return isinstance(msgs, list) and msgs and isinstance(msgs[0], dict)
+
 
 def vlm_generate(messages, max_new_tokens=128):
     # Normalize to batch
@@ -182,20 +190,25 @@ def vlm_generate(messages, max_new_tokens=128):
 
     # 5) Trim prompts using non-pad lengths
     pad_id = getattr(processor.tokenizer, "pad_token_id", None)
-    prompt_lens = (inputs.input_ids != pad_id).sum(dim=1).tolist() if pad_id is not None \
-                  else [len(ids) for ids in inputs.input_ids]
+    prompt_lens = (
+        (inputs.input_ids != pad_id).sum(dim=1).tolist()
+        if pad_id is not None
+        else [len(ids) for ids in inputs.input_ids]
+    )
 
     outs = []
     for i, out_ids in enumerate(gen_ids):
-        trimmed = out_ids[prompt_lens[i]:]
+        trimmed = out_ids[prompt_lens[i] :]
         outs.append(
-            processor.batch_decode([trimmed], skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+            processor.batch_decode(
+                [trimmed], skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )[0]
         )
 
     return outs[0] if _is_single_conv(messages) else outs
 
 
-@app.route('/qwen', methods=['POST'])
+@app.route("/qwen", methods=["POST"])
 def qwen():
     """
     POST form fields:
@@ -212,52 +225,60 @@ def qwen():
         media_type = None
 
         # Prefer 'video' if provided
-        if 'video' in request.files:
-            video_file = request.files['video']
-            if video_file.filename == '':
-                return jsonify({'error': 'no chosen video file'}), 400
-            media_type = 'video'
-        elif 'image' in request.files:
+        if "video" in request.files:
+            video_file = request.files["video"]
+            if video_file.filename == "":
+                return jsonify({"error": "no chosen video file"}), 400
+            media_type = "video"
+        elif "image" in request.files:
             # Could be multiple images
-            image_files = request.files.getlist('image')
+            image_files = request.files.getlist("image")
             if not image_files:
-                return jsonify({'error': 'no chosen image file'}), 400
-            media_type = 'image'
+                return jsonify({"error": "no chosen image file"}), 400
+            media_type = "image"
         else:
-            return jsonify({'error': 'no vision file found'}), 400
+            return jsonify({"error": "no vision file found"}), 400
 
-        if 'messages' not in request.form:
-            return jsonify({'error': 'messages field is required'}), 400
+        if "messages" not in request.form:
+            return jsonify({"error": "messages field is required"}), 400
 
         # Safer than eval
         try:
-            messages = json.loads(request.form['messages'])
+            messages = json.loads(request.form["messages"])
         except json.JSONDecodeError as e:
-            return jsonify({'error': f'Invalid JSON in messages: {e}'}), 400
+            return jsonify({"error": f"Invalid JSON in messages: {e}"}), 400
 
-        is_batch = _parse_bool(request.form.get('is_batch', False))
+        is_batch = _parse_bool(request.form.get("is_batch", False))
 
         # Normalize messages shape for processor:
         # - single: list[turn]
         # - batch:  list[list[turn]]
         if is_batch:
             if not (isinstance(messages, list) and messages and isinstance(messages[0], list)):
-                return jsonify({'error': 'Batch mode expects messages to be a list of conversations (list[list[turn]])'}), 400
+                return jsonify(
+                    {
+                        "error": "Batch mode expects messages to be a list of conversations (list[list[turn]])"
+                    }
+                ), 400
         else:
             if not (isinstance(messages, list) and messages and isinstance(messages[0], dict)):
-                return jsonify({'error': 'Single mode expects messages to be a single conversation (list[turn])'}), 400
+                return jsonify(
+                    {
+                        "error": "Single mode expects messages to be a single conversation (list[turn])"
+                    }
+                ), 400
 
         with lock:
             temp_paths_to_cleanup = []
 
-            if media_type == 'video':
+            if media_type == "video":
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
                     tmp.write(video_file.read())
                     tmp_path = tmp.name
                     temp_paths_to_cleanup.append(tmp_path)
                 messages = _inject_video_path_into_messages(messages, tmp_path)
 
-            elif media_type == 'image':
+            elif media_type == "image":
                 image_paths = []
                 for f in image_files:
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
@@ -280,11 +301,18 @@ def qwen():
         if is_batch and isinstance(vlm_output, list):
             return jsonify({"response": vlm_output})
         else:
-            return jsonify({"response": vlm_output if isinstance(vlm_output, str) else (vlm_output[0] if vlm_output else "")})
+            return jsonify(
+                {
+                    "response": vlm_output
+                    if isinstance(vlm_output, str)
+                    else (vlm_output[0] if vlm_output else "")
+                }
+            )
 
     except Exception:
         traceback.print_exc()
         return jsonify({"error": traceback.format_exc()}), 500
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     app.run(debug=False, host="0.0.0.0", port=17259)
