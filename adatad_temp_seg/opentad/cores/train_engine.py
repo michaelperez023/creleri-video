@@ -26,12 +26,6 @@ def train_one_epoch(
     model.train()
     for iter_idx, data_dict in enumerate(train_loader):
         optimizer.zero_grad()
-        
-        #print("data dict: ")
-        #print(data_dict)
-        
-        for meta in data_dict['metas']:
-            print(meta['video_name'])
 
         # current learning rate
         curr_backbone_lr = None

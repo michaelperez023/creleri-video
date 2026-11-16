@@ -1,3 +1,4 @@
+# Modified from OpenTAD (https://github.com/sming256/OpenTAD), Apache-2.0: exports SingleVideoDataset.
 from .builder import build_dataset, build_dataloader
 from .transforms import *
 from .base import *

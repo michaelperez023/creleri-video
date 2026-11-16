@@ -1,3 +1,4 @@
+# Modified from OpenTAD (https://github.com/sming256/OpenTAD), Apache-2.0: registers SingleVideoDataset.
 from .resize_dataset import ResizeDataset
 from .sliding_dataset import SlidingWindowDataset
 from .padding_dataset import PaddingDataset

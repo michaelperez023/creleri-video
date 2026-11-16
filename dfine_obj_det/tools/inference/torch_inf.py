@@ -17,7 +17,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'
 from src.core import YAMLConfig
 
 
-def draw(images, labels, boxes, scores, thrh=0.4,label_mapping=None):
+def draw(images, labels, boxes, scores, thrh=0.4):
     for i, im in enumerate(images):
         draw = ImageDraw.Draw(im)
 
@@ -25,25 +25,14 @@ def draw(images, labels, boxes, scores, thrh=0.4,label_mapping=None):
         lab = labels[i][scr > thrh]
         box = boxes[i][scr > thrh]
         scrs = scr[scr > thrh]
-        if label_mapping:
-            lab = [
-                        label_mapping.get(int(label), "unknown") for label in lab.tolist()
-                    ]
-                
+
         for j, b in enumerate(box):
             draw.rectangle(list(b), outline='red')
-            if label_mapping:
-                draw.text(
-                    (b[0], b[1]),
-                    text = f"{lab[j]} {round(scrs[j].item(), 2)}",
-                    fill='blue',
-                )
-            else:
-                draw.text(
-                    (b[0], b[1]),
-                    text=f"{lab[j].item()} {round(scrs[j].item(), 2)}",
-                    fill='blue',
-                )
+            draw.text(
+                (b[0], b[1]),
+                text=f"{lab[j].item()} {round(scrs[j].item(), 2)}",
+                fill='blue',
+            )
 
         im.save('torch_results.jpg')
 
@@ -64,19 +53,8 @@ def process_image(model, device, file_path):
 
     draw([im_pil], labels, boxes, scores)
 
-def load_label_mapping(label_yaml_path):
-    """
-    Load label mappings from a YAML file.
-    :param label_yaml_path: Path to the YAML file containing the label mappings.
-    :return: Dictionary mapping label IDs to names.
-    """
-    import yaml
 
-    with open(label_yaml_path, 'r') as file:
-        yaml_data = yaml.safe_load(file)
-    return yaml_data['names']
-    
-def process_video(model, device, file_path,label_mapping):
+def process_video(model, device, file_path):
     cap = cv2.VideoCapture(file_path)
 
     # Get video properties
@@ -110,9 +88,9 @@ def process_video(model, device, file_path,label_mapping):
 
         output = model(im_data, orig_size)
         labels, boxes, scores = output
-        
+
         # Draw detections on the frame
-        draw([frame_pil], labels, boxes, scores,label_mapping=label_mapping)
+        draw([frame_pil], labels, boxes, scores)
 
         # Convert back to OpenCV image
         frame = cv2.cvtColor(np.array(frame_pil), cv2.COLOR_RGB2BGR)
@@ -170,9 +148,7 @@ def main(args):
         print("Image processing complete.")
     else:
         # Process as video
-        label_yaml_path = "/data/enze/D-FINE/tools/inference/Objects365.yaml"
-        label_mapping = load_label_mapping(label_yaml_path)
-        process_video(model, device, file_path,label_mapping)
+        process_video(model, device, file_path)
 
 
 if __name__ == '__main__':

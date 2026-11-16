@@ -76,7 +76,6 @@ def eval_one_epoch(
             result_path = os.path.join(cfg.work_dir, "result_detection.json")
             with open(result_path, "w") as out:
                 json.dump(result_eval, out)
-            
 
         if not not_eval:
             # build evaluator

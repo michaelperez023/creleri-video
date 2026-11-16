@@ -1,0 +1,16 @@
+# Code vendored from upstream projects (see THIRD_PARTY_NOTICES.md) is left out of
+# GitHub's language statistics.
+adatad_temp_seg/opentad/** linguist-vendored
+dfine_obj_det/configs/** linguist-vendored
+dfine_obj_det/reference/** linguist-vendored
+dfine_obj_det/src/** linguist-vendored
+dfine_obj_det/tools/benchmark/** linguist-vendored
+dfine_obj_det/tools/dataset/** linguist-vendored
+dfine_obj_det/tools/deployment/** linguist-vendored
+dfine_obj_det/tools/visualization/** linguist-vendored
+dfine_obj_det/tools/inference/onnx_inf.py linguist-vendored
+dfine_obj_det/tools/inference/torch_inf.py linguist-vendored
+dfine_obj_det/tools/inference/trt_inf.py linguist-vendored
+dfine_obj_det/train.py linguist-vendored
+vlm_action_pipeline/grounded_sam_2/** linguist-vendored
+web_ui/static/plugins/** linguist-vendored

@@ -1,3 +1,4 @@
+# Modified from OpenTAD (https://github.com/sming256/OpenTAD), Apache-2.0: exports eval_one_epoch_single_video.
 from .train_engine import train_one_epoch, val_one_epoch
 from .test_engine import eval_one_epoch
 from .optimizer import build_optimizer

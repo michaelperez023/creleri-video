@@ -1,3 +1,4 @@
+# Modified from OpenTAD (https://github.com/sming256/OpenTAD), Apache-2.0: uses torch.amp custom_fwd/custom_bwd instead of the deprecated torch.cuda.amp ones.
 import sys
 
 import numpy as np

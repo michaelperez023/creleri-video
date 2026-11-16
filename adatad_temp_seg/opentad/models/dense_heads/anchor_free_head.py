@@ -116,12 +116,6 @@ class AnchorFreeHead(nn.Module):
             reg_pred.append(F.relu(self.scale[l](self.reg_head(reg_feat))))
 
         points = self.prior_generator(feat_list)
-        
-        #print(f"gt_segments length: {len(gt_segments)}")
-        #print(f"gt_labels length: {len(gt_labels)}")
-
-        #print(f"gt_segments[0] shape: {gt_segments[0].shape}")
-        #print(f"gt_labels[0] shape: {gt_labels[0].shape}")
 
         losses = self.losses(cls_pred, reg_pred, mask_list, points, gt_segments, gt_labels)
         return losses
@@ -291,10 +285,6 @@ class AnchorFreeHead(nn.Module):
 
             # cls_targets: F T x C; reg_targets F T x 2
             gt_label_one_hot = F.one_hot(gt_label.long(), self.num_classes).to(reg_targets.dtype)
-            
-            #print(f"min_len_mask shape: {min_len_mask.shape}")
-            #print(f"gt_label_one_hot shape: {gt_label_one_hot.shape}")
-            
             cls_targets = min_len_mask @ gt_label_one_hot
             # to prevent multiple GT actions with the same label and boundaries
             cls_targets.clamp_(min=0.0, max=1.0)

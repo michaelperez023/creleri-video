@@ -16,7 +16,7 @@ from utils.video_utils import create_video_from_images
 """
 Hyperparam for Ground and Tracking
 """
-MODEL_ID = "IDEA-Research/grounding-dino-base"
+MODEL_ID = "IDEA-Research/grounding-dino-tiny"
 VIDEO_PATH = "./assets/hippopotamus.mp4"
 TEXT_PROMPT = "hippopotamus."
 OUTPUT_VIDEO_PATH = "./hippopotamus_tracking_demo.mp4"
@@ -30,10 +30,10 @@ Step 1: Environment settings and model initialization for SAM 2
 # use bfloat16 for the entire notebook
 torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
 
-# if torch.cuda.get_device_properties(0).major >= 8:
-#     # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
-#     torch.backends.cuda.matmul.allow_tf32 = True
-#     torch.backends.cudnn.allow_tf32 = True
+if torch.cuda.get_device_properties(0).major >= 8:
+    # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 # init sam image predictor and video predictor model
 sam2_checkpoint = "./checkpoints/sam2_hiera_large.pt"
