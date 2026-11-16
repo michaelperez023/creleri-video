@@ -1,50 +1,67 @@
+"""Grounding API: locates an action's arguments in a clip and checks that they touch.
+
+POST /ground takes the clip and its (argument_names, action, caption) proposals and returns one
+job id per proposal. GET /result/{id} reports the verdict, and GET /result/{id}/video and
+GET /result/{id}/masks return the annotated clip and the argument masks.
+"""
+
 import argparse
 import asyncio
-from dataclasses import dataclass
+import concurrent.futures
+import contextlib
+import logging
+import os
+import pathlib
+import shutil
 import tempfile
+import time
 import uuid
+from dataclasses import dataclass, field
+from enum import Enum
+from io import BytesIO
+from timeit import default_timer
+from typing import Annotated, BinaryIO
 
+import cv2
 import mediapy as media
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, Response
-from grounding import SubjectObjectGrounding
-from pydantic import BaseModel, BeforeValidator, AfterValidator, field_serializer
-from typing_extensions import Annotated
-from enum import Enum
-from timeit import default_timer
-import cv2
-from io import BytesIO
-import os, concurrent.futures
-import pathlib
-import time
-import json
-import traceback
+from fastapi import FastAPI, Form, HTTPException, Response, UploadFile
+from fastapi.concurrency import run_in_threadpool
+from fastapi.exceptions import RequestValidationError
+from grounding import SubjectObjectGrounding, frame_cache_dir, private_dir
+from pydantic import AfterValidator, BaseModel, ValidationError, field_serializer
 
-UPLOAD_ROOT = os.environ.get(
-    "GROUNDING_UPLOAD_DIR", os.path.join(tempfile.gettempdir(), "grounding-uploads")
+logger = logging.getLogger(__name__)
+
+HERE = pathlib.Path(__file__).resolve().parent
+
+UPLOAD_ROOT = pathlib.Path(
+    os.environ.get("GROUNDING_UPLOAD_DIR")
+    or private_dir(pathlib.Path(tempfile.gettempdir()) / f"grounding-uploads-{os.getuid()}")
 )
-pathlib.Path(UPLOAD_ROOT).mkdir(parents=True, exist_ok=True)
+UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+
+# Container types accepted for the uploaded clip; `inputs.filename` only picks one of these.
+VIDEO_SUFFIXES = frozenset({".avi", ".mkv", ".mov", ".mp4", ".webm"})
 
 CONTACT_REQUIRED_ACTIONS: set[str] = set()
 
 
 def load_contact_required_actions(path: str | None) -> set[str]:
     """
-    One action verb per line; case-insensitive; '#' starts a comment.
-    Blank lines ignored.
+    One action per line, named as in adatad_temp_seg/action_categories.csv;
+    case-insensitive; '#' starts a comment. Blank lines ignored.
+    An empty path disables the contact requirement.
     """
     actions = set()
     if not path:
         return actions
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.split("#", 1)[0].strip().lower()
-                if line:
-                    actions.add(line)
-    except FileNotFoundError:
-        print(f"[grounding] contact-required file not found: {path} (continuing with empty set)")
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip().lower()
+            if line:
+                actions.add(line)
     return actions
 
 
@@ -52,40 +69,45 @@ def requires_contact(action: str) -> bool:
     return (action or "").strip().lower() in CONTACT_REQUIRED_ACTIONS
 
 
-def _write_upload_atomic(root_dir: str, suffix: str, data: bytes) -> str:
-    file_id = uuid.uuid4().hex
-    final_path = os.path.join(
-        root_dir, f"upload_{file_id}{suffix if suffix.startswith('.') else '.' + suffix}"
-    )
-    tmp_path = final_path + ".part"
-
-    with open(tmp_path, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-
-    # atomic rename in same dir
-    os.replace(tmp_path, final_path)
-    return final_path
+def _video_suffix(filename: str) -> str:
+    suffix = "." + filename.rsplit(".", 1)[-1].lower()
+    if suffix not in VIDEO_SUFFIXES:
+        raise HTTPException(422, f"unsupported video type: {filename!r}")
+    return suffix
 
 
-def _wait_until_exists(path: str, tries: int = 5, delay: float = 0.05) -> bool:
-    for _ in range(tries):
-        if os.path.exists(path):
-            return True
-        time.sleep(delay)
-    return False
+def _save_upload(src: BinaryIO, suffix: str) -> str:
+    path = os.path.join(UPLOAD_ROOT, f"upload_{uuid.uuid4().hex}{suffix}")
+    try:
+        with open(path, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+    except BaseException:
+        pathlib.Path(path).unlink(missing_ok=True)
+        raise
+    return path
+
+
+def _discard_upload(path: str) -> None:
+    """Delete an upload and the frames extracted from it."""
+    with contextlib.suppress(FileNotFoundError):
+        # The frame cache is keyed by the upload's path and mtime, so locate it first.
+        shutil.rmtree(frame_cache_dir(path), ignore_errors=True)
+        os.remove(path)
 
 
 ground = None
 app = FastAPI()
 
-result_counter = 0
-result_time_to_live = 100
+# Seconds a finished job's results stay available (--result-ttl). The web UI reads them only
+# once the whole video has been processed, which can take hours.
+result_ttl = 24 * 60 * 60
 
 THREAD_POOL = concurrent.futures.ThreadPoolExecutor(
-    max_workers=max(2, min(8, (os.cpu_count() or 4)))  # tune as you like
+    max_workers=max(2, min(8, (os.cpu_count() or 4)))
 )
+
+# The event loop keeps only weak references to tasks.
+_background_tasks: set[asyncio.Task] = set()
 
 
 def _build_artifacts(path, argument_masks, argument_names, action, contacts):
@@ -118,10 +140,6 @@ class GroundingInputs(BaseModel):
     subject_object_pairs: list[SubjectObjectPair]
 
 
-def validate_inputs(string):
-    return GroundingInputs.model_validate_json(string)
-
-
 class JobStatus(Enum):
     PENDING = 0
     SUCCESS_VALID = 1
@@ -133,12 +151,32 @@ class JobStatus(Enum):
 @dataclass
 class Job:
     id: uuid.UUID
-    done: asyncio.Event
+    done: asyncio.Event = field(default_factory=asyncio.Event)
     status: JobStatus = JobStatus.PENDING
     annotated_video: bytes | None = None
     argument_masks: bytes | None = None
     extra_info: dict | None = None
-    result_index: int | None = None
+    finished_at: float | None = None
+
+    def finish(
+        self,
+        status: JobStatus,
+        extra_info: dict | None = None,
+        annotated_video: bytes | None = None,
+        argument_masks: bytes | None = None,
+    ) -> None:
+        """Publish the final state in one step, so readers never see a partial result.
+
+        Only the first call counts; a cancelled job stays cancelled.
+        """
+        if self.done.is_set():
+            return
+        self.annotated_video = annotated_video
+        self.argument_masks = argument_masks
+        self.extra_info = extra_info
+        self.status = status
+        self.finished_at = time.monotonic()
+        self.done.set()
 
 
 class JobInfo(BaseModel):
@@ -270,96 +308,42 @@ def visualize_subject_object(video, objects, action, all_contacts, max_edge=1280
     return output, fps
 
 
-async def remove_old_results(older_than):
-    old_jobs = [
-        job
-        for job in ongoing_jobs.values()
-        if job.result_index is not None and job.result_index < older_than
+def evict_expired_results():
+    cutoff = time.monotonic() - result_ttl
+    expired = [
+        job_id
+        for job_id, job in ongoing_jobs.items()
+        if job.finished_at is not None and job.finished_at < cutoff
     ]
-    for job in old_jobs:
-        ongoing_jobs.pop(job.id)
-        job.done.set()
+    for job_id in expired:
+        del ongoing_jobs[job_id]
 
 
 def is_valid_argument_name(name):
     return name.lower() not in ("none", "unspecified", "unknown", "")
 
 
-async def do_grounding(video, inputs: GroundingInputs, jobs: list[Job]):
-    global result_counter
-    path = None
+async def do_grounding(path: str, pairs: list[SubjectObjectPair], jobs: list[Job]):
+    loop = asyncio.get_running_loop()
+    arguments = [[n for n in p.argument_names if is_valid_argument_name(n)] for p in pairs]
     try:
-        suffix = inputs.filename if inputs.filename.startswith(".") else f".{inputs.filename}"
-        path = _write_upload_atomic(UPLOAD_ROOT, suffix, video)
+        results = ground(path, [(names, p.caption) for names, p in zip(arguments, pairs)])
+        for i, (job, pair, argument_names) in enumerate(zip(jobs, pairs, arguments)):
+            if all(j.done.is_set() for j in jobs[i:]):
+                break  # every remaining job was cancelled
+            start = default_timer()
+            result, extra_info = await loop.run_in_executor(THREAD_POOL, next, results)
+            if job.done.is_set():
+                continue
 
-        if not _wait_until_exists(path):
-            print(f"Upload write looks successful but file not found: {path}")
-            raise RuntimeError("Upload write failed (path missing)")
-
-        print(f"Grounding on {path} (size={os.path.getsize(path) / 1e6} MB)")
-
-        validated_pairs = []
-        for p in inputs.subject_object_pairs:
-            argument_names = [n for n in p.argument_names if is_valid_argument_name(n)]
-            validated_pairs.append((argument_names, p.caption))
-
-        ongoing_jobs.update((job.id, job) for job in jobs)
-
-        # 3) Build sync generator
-        results = ground(path, validated_pairs)
-
-        loop = asyncio.get_running_loop()
-
-        for i, _ in enumerate(inputs.subject_object_pairs):
-            t0 = default_timer()
-
-            # Double-check existence before each heavy step (optional but helpful)
-            if not os.path.exists(path):
-                print(f"Video file disappeared before processing job {i}: {path}")
-                raise RuntimeError("Video file disappeared")
-
-            # 4) Pull next() in a thread (with its own existence check)
-            def _next_with_check():
-                if not os.path.exists(path):
-                    raise FileNotFoundError(f"Video path missing in worker: {path}")
-                return next(results)
-
-            try:
-                result, extra_info = await loop.run_in_executor(THREAD_POOL, _next_with_check)
-            except Exception as e:
-                tb = "".join(traceback.TracebackException.from_exception(e).format())
-                failed_ids = []
-                for job in jobs[i:]:
-                    job.status = JobStatus.EXCEPTION
-                    job.extra_info = {"error": repr(e), "traceback": tb}
-                    job.done.set()
-                    failed_ids.append(str(job.id))
-                    print(f"grounding job finished: {job.id} [EXCEPTION]")
-                print(f"Jobs {', '.join(failed_ids)} failed because of exception: {e!r}\n{tb}")
-                return
-
-            job = jobs[i]
-            job.status = JobStatus.SUCCESS_INVALID
-            job.result_index = result_counter
-
+            status = JobStatus.SUCCESS_INVALID
+            video_bytes = masks_bytes = None
             if result is not None:
                 argument_masks, has_contact, contacts = result
 
-                # the requested action for this pair
-                requested_action = inputs.subject_object_pairs[i].action
-
                 # apply policy: only *require* contact for some actions
-                need_contact = requires_contact(requested_action)
-                is_valid = bool(has_contact) or (not need_contact)
-
-                # label and job status
-                action = requested_action if is_valid else "???"
-                job.status = JobStatus.SUCCESS_VALID if is_valid else JobStatus.SUCCESS_INVALID
-
-                # only overlay contact mask when it matters; skip otherwise
-                contacts_for_viz = contacts if need_contact else None
-
-                argument_names, _ = validated_pairs[i]
+                need_contact = requires_contact(pair.action)
+                is_valid = bool(has_contact) or not need_contact
 
                 if is_valid:
                     # build overlays ONLY for valid results
@@ -369,16 +353,13 @@ async def do_grounding(video, inputs: GroundingInputs, jobs: list[Job]):
                         path,
                         argument_masks,
                         argument_names,
-                        action,
+                        pair.action,
+                        # only overlay contact points when the action requires them
                         contacts if need_contact else None,
                     )
-                    job.annotated_video = video_bytes
-                    job.argument_masks = masks_bytes
                     extra_info["visualization_time"] = viz_time
+                    status = JobStatus.SUCCESS_VALID
                 else:
-                    # no artifacts for invalid → has_visualization becomes False
-                    job.annotated_video = None
-                    job.argument_masks = None
                     extra_info["rejection_reason"] = (
                         "contact-required action with no contact detected"
                     )
@@ -391,47 +372,47 @@ async def do_grounding(video, inputs: GroundingInputs, jobs: list[Job]):
                     }
                 )
 
-            extra_info["subject_object_pair"] = inputs.subject_object_pairs[i]
-            job.extra_info = extra_info
-            job.done.set()
-            elapsed = default_timer() - t0
-            print(f"grounding job finished: {job.id} [{job.status.name}] in {elapsed:.2f}s")
-
-        result_counter += 1
-        loop.create_task(remove_old_results(result_counter - result_time_to_live))
-
+            extra_info["subject_object_pair"] = pair
+            job.finish(status, extra_info, video_bytes, masks_bytes)
+            elapsed = default_timer() - start
+            logger.info("Grounding job %s finished: %s in %.2fs", job.id, job.status.name, elapsed)
+    except Exception as e:
+        failed = [job for job in jobs if not job.done.is_set()]
+        logger.exception("Grounding jobs failed: %s", ", ".join(str(job.id) for job in failed))
+        for job in failed:
+            job.finish(JobStatus.EXCEPTION, {"error": type(e).__name__})
     finally:
-        if path:
-            try:
-                os.remove(path)
-            except FileNotFoundError:
-                pass
+        await asyncio.to_thread(_discard_upload, path)
 
 
 @app.post("/ground")
 async def ground_subject_object(
-    video: Annotated[bytes, File()],
-    inputs: Annotated[GroundingInputs, BeforeValidator(validate_inputs), Form()],
+    video: UploadFile,
+    inputs: Annotated[str, Form()],
 ) -> list[uuid.UUID]:
-    print("received grounding job")
+    # `inputs` is a single JSON-encoded form field. Declared as a model-typed Form(), newer
+    # FastAPI versions would instead look for one form field per model field.
+    try:
+        parsed = GroundingInputs.model_validate_json(inputs)
+    except ValidationError as e:
+        raise RequestValidationError(e.errors()) from e
+    path = await run_in_threadpool(_save_upload, video.file, _video_suffix(parsed.filename))
 
-    jobs = [Job(id=uuid.uuid4(), done=asyncio.Event()) for _ in inputs.subject_object_pairs]
+    evict_expired_results()
+    jobs = [Job(id=uuid.uuid4()) for _ in parsed.subject_object_pairs]
+    ongoing_jobs.update((job.id, job) for job in jobs)
 
-    jobs_with_inputs = [
-        {"job_id": str(job.id), **pair.model_dump()}
-        for job, pair in zip(jobs, inputs.subject_object_pairs)
-    ]
-    print("grounding requests:\n" + json.dumps(jobs_with_inputs, ensure_ascii=False, indent=2))
+    task = asyncio.create_task(do_grounding(path, parsed.subject_object_pairs, jobs))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
-    loop = asyncio.get_running_loop()
-    loop.create_task(do_grounding(video, inputs, jobs))
+    logger.info("Queued grounding jobs: %s", ", ".join(str(job.id) for job in jobs))
     return [job.id for job in jobs]
 
 
 @app.get("/result/{job_id}")
-async def get_result(job_id: JobID) -> JobInfo:
+async def get_result_info(job_id: JobID) -> JobInfo:
     job = ongoing_jobs[job_id]
-    # await job.done.wait()
     return JobInfo(
         id=job.id,
         status=job.status,
@@ -440,24 +421,30 @@ async def get_result(job_id: JobID) -> JobInfo:
     )
 
 
+async def _finished_job(job_id: uuid.UUID) -> Job:
+    job = ongoing_jobs[job_id]
+    await job.done.wait()
+    return job
+
+
+def _artifact_response(job: Job, content: bytes | None, media_type: str) -> Response:
+    if job.status is JobStatus.EXCEPTION:
+        return Response(status_code=500)
+    if job.status is JobStatus.CANCELLED:
+        return Response(status_code=444)
+    if content is None:
+        return Response(status_code=204)
+    return Response(content, media_type=media_type)
+
+
 @app.get(
     "/result/{job_id}/video",
     responses={200: {"content": {"video/mp4": {}}}},
     response_class=Response,
 )
-async def get_result(job_id: JobID):
-    job = ongoing_jobs[job_id]
-    await job.done.wait()
-    if job.status in (JobStatus.SUCCESS_VALID, JobStatus.SUCCESS_INVALID):
-        if job.annotated_video is None:
-            return Response(status_code=204)
-        else:
-            return Response(job.annotated_video, media_type="video/mp4")
-    elif job.status == JobStatus.EXCEPTION:
-        return Response(status_code=500)
-    elif job.status == JobStatus.CANCELLED:
-        return Response(status_code=444)
-    raise NotImplementedError(job.status)
+async def get_result_video(job_id: JobID) -> Response:
+    job = await _finished_job(job_id)
+    return _artifact_response(job, job.annotated_video, "video/mp4")
 
 
 @app.get(
@@ -465,73 +452,80 @@ async def get_result(job_id: JobID):
     responses={200: {"content": {"application/octet-stream": {}}}},
     response_class=Response,
 )
-async def get_result(job_id: JobID):
-    job = ongoing_jobs[job_id]
-    await job.done.wait()
-    if job.status in (JobStatus.SUCCESS_VALID, JobStatus.SUCCESS_INVALID):
-        if job.annotated_video is None:
-            return Response(status_code=204)
-        else:
-            return Response(job.argument_masks, media_type="application/octet-stream")
-    elif job.status == JobStatus.EXCEPTION:
-        return Response(status_code=500)
-    elif job.status == JobStatus.CANCELLED:
-        return Response(status_code=444)
-    raise NotImplementedError(job.status)
+async def get_result_masks(job_id: JobID) -> Response:
+    job = await _finished_job(job_id)
+    return _artifact_response(job, job.argument_masks, "application/octet-stream")
 
 
 @app.delete("/result")
 async def delete_results() -> list[uuid.UUID]:
-    ids = []
-    for job in ongoing_jobs.values():
-        ids.append(job.id)
-        job.done.set()
+    jobs = list(ongoing_jobs.values())
     ongoing_jobs.clear()
-    return ids
+    for job in jobs:
+        job.finish(JobStatus.CANCELLED)
+    return [job.id for job in jobs]
 
 
 @app.delete("/result/{job_id}")
 async def delete_result(job_id: JobID) -> uuid.UUID:
     job = ongoing_jobs.pop(job_id)
-    job.done.set()
+    job.finish(JobStatus.CANCELLED)
     return job.id
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--devices", "-d", nargs="+", default=list(range(4)), type=int)
-    parser.add_argument("--port", "-p", type=int, default=12000)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("CRELERI_HOST", "127.0.0.1"),
+        help="interface to bind (default: $CRELERI_HOST or 127.0.0.1)",
+    )
+    parser.add_argument("--port", "-p", type=int, default=12000, help="port (default: %(default)s)")
+    parser.add_argument(
+        "--devices",
+        "-d",
+        nargs="+",
+        default=list(range(4)),
+        type=int,
+        help="GPU indices: the first runs DepthPro and GroundingDINO, each other one runs a "
+        "SAM 2 + Molmo worker (default: 0 1 2 3)",
+    )
     parser.add_argument(
         "--depth_pro_ckpt",
-        type=str,
-        default="./depth_pro.pt",
+        default=str(HERE / "depth_pro.pt"),
+        help="Depth Pro checkpoint (default: depth_pro.pt next to this file)",
     )
     parser.add_argument(
         "-t",
         "--result-ttl",
-        type=int,
-        default=100,
+        type=float,
+        default=result_ttl,
+        help="seconds to keep a finished job's results. Results, including the annotated video "
+        "and masks, stay in memory until the first /ground request after they expire "
+        "(default: %(default)s, one day)",
     )
     parser.add_argument(
         "--contact-required-file",
-        type=str,
-        default="contact_required_actions.txt",
-        help="Path to a text file listing actions that require contact (one per line).",
+        default=str(HERE / "contact_required_actions.txt"),
+        help="actions that require contact, one per line; an empty value turns the check off "
+        "(default: contact_required_actions.txt next to this file)",
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+    result_ttl = args.result_ttl
+    CONTACT_REQUIRED_ACTIONS = load_contact_required_actions(args.contact_required_file)
+    logger.info(
+        "Actions requiring contact: %s", ", ".join(sorted(CONTACT_REQUIRED_ACTIONS)) or "none"
     )
 
-    args = parser.parse_args()
-    result_time_to_live = args.result_ttl
-
-    CONTACT_REQUIRED_ACTIONS = load_contact_required_actions(args.contact_required_file)
-    # print(f"[grounding] actions requiring contact: {sorted(CONTACT_REQUIRED_ACTIONS)}")
-
-    devices = [f"cuda:{i}" for i in args.devices]
-
     ground = SubjectObjectGrounding(
-        devices=devices,
+        devices=[f"cuda:{i}" for i in args.devices],
         depth_pro_ckpt=args.depth_pro_ckpt,
         mask_video_max_frames=9,
     )
 
-    uvicorn.run(app, host="0.0.0.0", port=args.port)
+    uvicorn.run(app, host=args.host, port=args.port)
     ground.shutdown()

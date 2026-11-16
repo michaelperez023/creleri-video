@@ -1,3 +1,5 @@
+# Actions whose arguments must touch for a grounded prediction to count as valid.
+# One action per line, spelled exactly as in adatad_temp_seg/action_categories.csv.
 attach
 carry
 catch
@@ -15,11 +17,11 @@ hammer
 hug
 ignite
 kick
-pick_up
+pick up
 plug
 pull
 push
-put_down
+put
 saw
 skewer
 stir

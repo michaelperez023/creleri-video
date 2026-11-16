@@ -1,40 +1,59 @@
 import copy
+import fcntl
 import functools
+import hashlib
+import inspect
 import itertools
+import json
 import operator
 import os
+import pathlib
 import re
+import shlex
+import subprocess
+import tempfile
 import threading
+import xml.etree.ElementTree as ET
 from collections import defaultdict
+from collections.abc import Iterator
 from dataclasses import dataclass
 from timeit import default_timer
-from typing import Any, Iterator
-from transformers import GenerationConfig
-import xml.etree.ElementTree as ET
+from typing import Any
 
 import depth_pro
+import grounding_multiprocessing as grounding_mp
 import numpy as np
+import requests
 import torch
 from decord import VideoReader
-from decord.bridge import _BridgeScope
 from numba import njit
 from PIL import Image
 from scipy.ndimage import zoom
 from skimage.morphology import remove_small_holes, remove_small_objects
-from transformers import pipeline
-import grounding_multiprocessing as grounding_mp
 from torch import multiprocessing
-import hashlib, pathlib, json, subprocess, shlex
-import inspect
-import requests
+from transformers import GenerationConfig, pipeline
 
-import time, errno
-
-LLAMA_PORT = 5003
+LLAMA_API_URL = os.environ.get("LLAMA_API_URL", "http://localhost:5003").rstrip("/")
 
 os.environ.setdefault("TQDM_DISABLE", "1")
 
-CACHE_ROOT = pathlib.Path("/tmp/sam2_cache")  # node-local
+
+def private_dir(path: str | os.PathLike) -> pathlib.Path:
+    """Create `path` if needed and make it accessible to the current user only."""
+    path = pathlib.Path(path)
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # The default locations have predictable names in the shared temp dir, and mkdir leaves
+    # an existing directory as it is, so another user could have created it first.
+    if path.lstat().st_uid != os.getuid():
+        raise RuntimeError(f"{path} is owned by another user")
+    path.chmod(0o700)
+    return path
+
+
+CACHE_ROOT = pathlib.Path(
+    os.environ.get("SAM2_CACHE_DIR")
+    or private_dir(pathlib.Path(tempfile.gettempdir()) / f"sam2_cache_{os.getuid()}")
+)
 CACHE_ROOT.mkdir(exist_ok=True, parents=True)
 
 
@@ -46,11 +65,14 @@ def _video_hash(path):
     return h.hexdigest()
 
 
+def frame_cache_dir(video: str) -> pathlib.Path:
+    """Directory that holds the JPEG frames SAM 2 tracks for `video`."""
+    return CACHE_ROOT / _video_hash(video)
+
+
 def ensure_jpeg_dir(mp4_path, long_edge=1280):
-    vid_hash = _video_hash(mp4_path)
-    out_dir = CACHE_ROOT / vid_hash
+    out_dir = frame_cache_dir(mp4_path)
     marker = out_dir / "done.json"
-    lock = out_dir / ".lock"
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -58,46 +80,33 @@ def ensure_jpeg_dir(mp4_path, long_edge=1280):
     if marker.exists():
         return str(out_dir)
 
-    # try to acquire lock (atomic create)
-    try:
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        # someone else is extracting; wait for marker
-        for _ in range(600):  # up to ~60s
-            if marker.exists():
-                return str(out_dir)
-            time.sleep(0.1)
-        raise RuntimeError(f"Timeout waiting for frame extraction in {out_dir}")
-    else:
-        # we hold the lock
-        with os.fdopen(fd, "w") as f:
-            f.write(str(os.getpid()))
-
-        try:
-            tmpl = str(out_dir / "%05d.jpg")
-            cmd = (
-                f"ffmpeg -hide_banner -loglevel error -nostats -y "
-                f"-i {shlex.quote(mp4_path)} -q:v 2 "
-                f"-vf \"scale='if(gt(iw,ih),{long_edge},-2)':'if(gt(iw,ih),-2,{long_edge})'\" "
-                f"-start_number 0 {shlex.quote(tmpl)}"
-            )
-            subprocess.run(cmd, shell=True, check=True)
-
-            # basic sanity
-            imgs = list(out_dir.glob("*.jpg"))
-            if not imgs or any(p.stat().st_size == 0 for p in imgs[:5]):
-                # if something went wrong, clean up so next try can regenerate
-                for p in out_dir.glob("*.jpg"):
-                    p.unlink(missing_ok=True)
-                raise RuntimeError("Frame extraction produced no/empty JPEGs")
-
-            marker.write_text(json.dumps({"src": mp4_path, "long_edge": long_edge}))
+    # Every pool worker tracking this video waits for one extraction, however long it takes.
+    # The kernel releases the lock if its holder dies, so a crashed extraction cannot block
+    # the others.
+    with open(out_dir / ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if marker.exists():
             return str(out_dir)
-        finally:
-            try:
-                os.unlink(lock)
-            except FileNotFoundError:
-                pass
+
+        tmpl = str(out_dir / "%05d.jpg")
+        cmd = (
+            f"ffmpeg -hide_banner -loglevel error -nostats -y "
+            f"-i {shlex.quote(mp4_path)} -q:v 2 "
+            f"-vf \"scale='if(gt(iw,ih),{long_edge},-2)':'if(gt(iw,ih),-2,{long_edge})'\" "
+            f"-start_number 0 {shlex.quote(tmpl)}"
+        )
+        subprocess.run(cmd, shell=True, check=True)
+
+        # basic sanity
+        imgs = list(out_dir.glob("*.jpg"))
+        if not imgs or any(p.stat().st_size == 0 for p in imgs[:5]):
+            # if something went wrong, clean up so next try can regenerate
+            for p in out_dir.glob("*.jpg"):
+                p.unlink(missing_ok=True)
+            raise RuntimeError("Frame extraction produced no/empty JPEGs")
+
+        marker.write_text(json.dumps({"src": mp4_path, "long_edge": long_edge}))
+        return str(out_dir)
 
 
 # Fix to get GroundingDINO to build correctly
@@ -308,7 +317,7 @@ def track_items(args: tuple[str, list[tuple[int, dict]], int, int, float, int]):
 class SubjectObjectGrounding:
     def __init__(
         self,
-        devices: list = [f"cuda{i}" for i in range(8)],
+        devices: list = [f"cuda{i}" for i in range(8)],  # noqa: B006
         grounding_threshold=0.3,
         grounding_n_frames: int = 5,
         tracking_max_edge: int = 1280,
@@ -389,7 +398,13 @@ class SubjectObjectGrounding:
             device=default_device,
         )
 
-        worker_ready.wait()
+        try:
+            worker_ready.wait()
+        except threading.BrokenBarrierError:
+            self.pool.terminate()
+            raise RuntimeError(
+                "A grounding worker failed to load SAM 2 or Molmo; see its traceback above."
+            ) from None
 
     def shutdown(self):
         self.pool.close()
@@ -409,7 +424,7 @@ class SubjectObjectGrounding:
         return frames, indices
 
     def _llama_rewrite_point_to_prompts(self, item_and_captions):
-        url = f"http://localhost:{LLAMA_PORT}/llama33"
+        url = f"{LLAMA_API_URL}/llama33"
         msgs = []
         for item, caption in item_and_captions:
             msgs.append(
