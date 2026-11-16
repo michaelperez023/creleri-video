@@ -1,32 +1,53 @@
+"""CReLeRI object-proposal service.
+
+POST /process_video with {"video_path": "<local video file>"}. Objects are detected with D-FINE
+(Objects365 classes) and tracked with StrongSORT. Each allowed object that is tracked through
+enough of the clip is boxed in a copy of the video, which the Qwen2.5-VL service captions.
+The response lists the objects and, aligned with them, three captions per object. Tracks whose
+captioning fails are left out; if captioning fails for every track, the service answers 502.
+
+Environment: DFINE_CKPT (D-FINE checkpoint), QWEN_API_URL (captioning service base URL),
+CRELERI_HOST (bind address).
+"""
+
+import argparse
+import json
+import logging
+import os
+import sys
+import tempfile
+from collections import Counter
+from pathlib import Path
+
+import cv2
+import numpy as np
+import requests
 import torch
 import torch.nn as nn
 import torchvision.transforms as T
-import numpy as np
+import yaml
+from boxmot import StrongSort
+from flask import Flask, jsonify, request
 from PIL import Image
-import cv2
-import os
-import sys
-import json
 from torch import amp
-from pathlib import Path
-from collections import Counter
-from flask import Flask, request, jsonify
-import requests
 
-from strong_sort import StrongSort
+HERE = Path(__file__).resolve().parent
+DFINE_ROOT = HERE.parents[1]
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
-from src.core import YAMLConfig
+sys.path.append(str(DFINE_ROOT))
+from src.core import YAMLConfig  # noqa: E402
 
-app = Flask(__name__)
+logger = logging.getLogger(__name__)
 
-QWEN_PORT = 17259
+CONFIG_PATH = DFINE_ROOT / "configs/dfine/objects365/dfine_hgnetv2_x_obj365.yml"
+CHECKPOINT_PATH = Path(os.environ.get("DFINE_CKPT") or DFINE_ROOT / "dfine_x_obj365.pth")
+LABEL_YAML_PATH = HERE / "Objects365.yaml"
+# boxmot downloads these ReID weights to this path the first time a tracker is built.
+REID_WEIGHTS = HERE / "osnet_ain_x1_0_msmt17.pt"
+QWEN_API_URL = (os.environ.get("QWEN_API_URL") or "http://localhost:17259").rstrip("/")
+DEVICE = "cuda:0"
 
-# Initialize model once
-CONFIG_PATH = "../../configs/dfine/objects365/dfine_hgnetv2_x_obj365.yml"
-RESUME_PATH = "../../dfine_x_obj365.pth"
-LABEL_YAML_PATH = "Objects365.yaml"
-
+# Objects365 classes proposed for captioning; tracks of any other class are dropped.
 ALLOWED_LABELS = {
     "Person",
     "Car",
@@ -106,71 +127,54 @@ ALLOWED_LABELS = {
     "Rabbit",
     "Yak",
     "Gun",
-    "Bow",
-    "Arrow",
-    "Sword",
-    "Shield",
-    "Robot",
-    "Drone",
-    "Excavator",
-    "Bulldozer",
-    "Crane",
-    "Helicopter",
-    "Factory Machine",
-    "Forklift",
-    "Autonomous Vehicle",
-    "Roomba",
     "Dishwasher",
     "Washing Machine/Drying Machine",
     "Blender",
     "Coffee Machine",
-    "3D Printer",
-    "Industrial Robot",
-    "Vacuum Cleaner",
-    "Lawn Mower",
-    "Autonomous Tractor",
 }
 
+CAPTION_PROMPTS = [
+    "What is the {object} doing in the video? Please only provide a caption if there is a clear action.",
+    "Describe what the {object} is doing in the video. If there is no action, type 'no action'.",
+    "What is the {object} doing in the video? If no action is observed, type 'no action'.",
+]
 
-def load_label_mapping(label_yaml_path):
-    import yaml
-
-    with open(label_yaml_path, "r") as file:
-        yaml_data = yaml.safe_load(file)
-    return yaml_data["names"]
-
-
-cfg = YAMLConfig(CONFIG_PATH, resume=RESUME_PATH)
-if "HGNetv2" in cfg.yaml_cfg:
-    cfg.yaml_cfg["HGNetv2"]["pretrained"] = False
-
-if RESUME_PATH:
-    checkpoint = torch.load(RESUME_PATH, map_location="cpu")
-    if "ema" in checkpoint:
-        state = checkpoint["ema"]["module"]
-    else:
-        state = checkpoint["model"]
-else:
-    raise AttributeError("Only support resume to load model.state_dict by now.")
-
-cfg.model.load_state_dict(state)
+app = Flask(__name__)
+model = label_mapping = None  # set by load_model()
 
 
 class Model(nn.Module):
-    def __init__(self):
+    def __init__(self, cfg):
         super().__init__()
         self.model = cfg.model.deploy()
         self.postprocessor = cfg.postprocessor.deploy()
 
     def forward(self, images, orig_target_sizes):
         outputs = self.model(images)
-        outputs = self.postprocessor(outputs, orig_target_sizes)
-        return outputs
+        return self.postprocessor(outputs, orig_target_sizes)
 
 
-model = Model().to("cuda:0")
-model.eval()
-label_mapping = load_label_mapping(LABEL_YAML_PATH)
+def load_model():
+    """Load the D-FINE detector onto DEVICE and the Objects365 label names."""
+    global model, label_mapping
+    cfg = YAMLConfig(str(CONFIG_PATH))
+    if "HGNetv2" in cfg.yaml_cfg:
+        cfg.yaml_cfg["HGNetv2"]["pretrained"] = False
+
+    checkpoint = torch.load(CHECKPOINT_PATH, map_location="cpu", weights_only=True)
+    state = checkpoint["ema"]["module"] if "ema" in checkpoint else checkpoint["model"]
+    cfg.model.load_state_dict(state)
+    logger.info("Loaded D-FINE weights from %s", CHECKPOINT_PATH)
+
+    model = Model(cfg).to(DEVICE)
+    model.eval()
+
+    with open(LABEL_YAML_PATH) as f:
+        label_mapping = yaml.safe_load(f)["names"]
+
+    unknown_labels = ALLOWED_LABELS - set(label_mapping.values())
+    if unknown_labels:
+        logger.warning("ALLOWED_LABELS that are not Objects365 classes: %s", sorted(unknown_labels))
 
 
 def compute_iou(box1, box2):
@@ -188,66 +192,51 @@ def compute_iou(box1, box2):
     return inter_area / union_area if union_area > 0 else 0
 
 
-def generate_video(
-    input_file, track_data, track_id, label_name, output_file, frame_width, frame_height, fps
-):
+def generate_video(input_file, boxes_by_frame, output_file, frame_width, frame_height, fps):
+    """Copy the input video with the track's box drawn on every frame it was tracked in."""
+    out = cv2.VideoWriter(
+        output_file, cv2.VideoWriter_fourcc(*"mp4v"), fps, (frame_width, frame_height)
+    )
+    if not out.isOpened():
+        raise RuntimeError(f"Cannot write video: {output_file}")
+
     cap = cv2.VideoCapture(input_file)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = None
-
     frame_count = 0
-
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Draw blue bounding boxes for the track on the frame
-        for bbox in track_data["bboxes"]:
-            if bbox["frame"] == frame_count:
-                x1, y1, x2, y2 = map(int, bbox["bbox"])
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)  # Blue box (BGR format)
-
-        if out is None:
-            out = cv2.VideoWriter(output_file, fourcc, fps, (frame_width, frame_height))
+        bbox = boxes_by_frame.get(frame_count)
+        if bbox is not None:
+            x1, y1, x2, y2 = map(int, bbox)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)  # Blue box (BGR format)
 
         out.write(frame)
         frame_count += 1
 
     cap.release()
-    if out:
-        out.release()
+    out.release()
 
 
-def process_video(model, device, file_path, threshold=0.5, output_dir="./tmp2"):
-    filename_without_extension = os.path.splitext(os.path.basename(file_path))[0]
-    segment_output_dir = os.path.join(output_dir, filename_without_extension)
-    if os.path.exists(segment_output_dir) and len(os.listdir(segment_output_dir)) > 0:
-        print(
-            f"Output folder {segment_output_dir} already exists and is not empty. Skipping video processing."
-        )
-        return segment_output_dir
+def process_video(model, device, video_path, out_dir, threshold=0.5):
+    """Detect, track and label the objects in a video, writing one clip per allowed track.
 
-    if not os.path.exists(segment_output_dir):
-        os.makedirs(segment_output_dir)
-    cap = cv2.VideoCapture(file_path)
+    Returns (label, clip_path) pairs in the order the tracks first appeared.
+    """
+    cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        raise RuntimeError(f"Cannot open video: {file_path}")
+        raise RuntimeError(f"Cannot open video: {video_path}")
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
-    fps = float(fps)
-    frame_count = 0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Initialize StrongSort
     tracker = StrongSort(
-        reid_weights=Path(
-            "osnet_ain_x1_0_msmt17_256x128_amsgrad_ep50_lr0.0015_coslr_b64_fb10_softmax_labsmth_flip_jitter.pt"
-        ),
+        reid_weights=REID_WEIGHTS,
         device=device,
-        half=device != "cpu",  # Use half precision if device is not CPU
+        half=device != "cpu",
         max_cos_dist=0.7,
         max_iou_dist=0.7,
         max_age=30,
@@ -265,30 +254,25 @@ def process_video(model, device, file_path, threshold=0.5, output_dir="./tmp2"):
     )
     track_records = {}
 
-    print("Processing video frames...")
+    frame_count = 0
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Convert frame to PIL and preprocess
         frame_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         w, h = frame_pil.size
         orig_size = torch.tensor([[w, h]]).to(device)
         im_data = transforms(frame_pil).unsqueeze(0).to(device)
 
-        # Model inference with mixed precision
         with torch.inference_mode(), amp.autocast("cuda"):
-            output = model(im_data, orig_size)
-            labels, boxes, scores = output
+            labels, boxes, scores = model(im_data, orig_size)
 
-        # Filter detections by threshold
         valid_indices = scores[0] > threshold
-        filtered_boxes = boxes[0][valid_indices].detach().cpu()  # Detach and move to CPU
-        filtered_labels = labels[0][valid_indices].detach().cpu()  # Detach and move to CPU
-        filtered_scores = scores[0][valid_indices].detach().cpu()  # Detach and move to CPU
+        filtered_boxes = boxes[0][valid_indices].detach().cpu()
+        filtered_labels = labels[0][valid_indices].detach().cpu()
+        filtered_scores = scores[0][valid_indices].detach().cpu()
 
-        # Prepare detections for StrongSort
         detection_array = np.array(
             [
                 [float(x1), float(y1), float(x2), float(y2), float(score), int(label)]
@@ -298,16 +282,11 @@ def process_video(model, device, file_path, threshold=0.5, output_dir="./tmp2"):
             dtype=float,
         )
 
-        # Update StrongSort tracker
-        track_outputs = tracker.update(detection_array, frame)
-
-        # Process confirmed tracks
-        for track in track_outputs:
-            x1, y1, x2, y2, track_id, conf, cls, det_ind = track
+        for x1, y1, x2, y2, track_id, *_ in tracker.update(detection_array, frame):
             bbox = [x1, y1, x2, y2]
 
             if track_id not in track_records:
-                track_records[track_id] = {"labels": [], "bboxes": []}
+                track_records[track_id] = {"labels": [], "boxes": {}}
 
             # Match detection to track label
             matched_label = None
@@ -321,161 +300,141 @@ def process_video(model, device, file_path, threshold=0.5, output_dir="./tmp2"):
             if matched_label is not None:
                 track_records[track_id]["labels"].append(matched_label)
 
-            track_records[track_id]["bboxes"].append({"frame": frame_count, "bbox": bbox})
+            track_records[track_id]["boxes"][frame_count] = bbox
 
         frame_count += 1
         if frame_count % 10 == 0:
-            print(f"Processed {frame_count}/{total_frames} frames...")
+            logger.debug("Processed %d/%d frames", frame_count, total_frames)
 
     cap.release()
 
-    # Calculate the final label for each track
-    for track_id, record in track_records.items():
-        # Use majority vote to determine the final label
-        if record["labels"]:
-            label_counter = Counter(record["labels"])
-            most_common_label, _ = label_counter.most_common(1)[0]
-            record["final_label"] = most_common_label
-            record["final_label_text"] = (
-                label_mapping[most_common_label - 1] if label_mapping else str(most_common_label)
-            )
-        else:
-            record["final_label"] = None
-            record["final_label_text"] = None
-
-        record["coverage"] = len(record["bboxes"]) / total_frames
-
-    # Filter tracks based on coverage threshold
     coverage_threshold = 0.2
-    valid_tracks = {
-        track_id: record
-        for track_id, record in track_records.items()
-        if record["coverage"] >= coverage_threshold and record["final_label"] is not None
-    }
+    tracks = []
+    disallowed_labels = set()
+    for track_id, record in track_records.items():
+        if len(record["boxes"]) / total_frames < coverage_threshold or not record["labels"]:
+            continue
 
-    if not valid_tracks:
-        print("No valid tracks; returning empty folder.")
-        return folder_path
+        # Majority vote; the model's labels are 1-based Objects365 ids, the YAML is 0-based.
+        most_common_label, _ = Counter(record["labels"]).most_common(1)[0]
+        label = label_mapping[most_common_label - 1]
+        if label not in ALLOWED_LABELS:
+            disallowed_labels.add(label)
+            continue
 
-    valid_labels = [
-        rec.get("final_label_text") for rec in valid_tracks.values() if rec.get("final_label_text")
+        clip_path = os.path.join(out_dir, f"track_{int(track_id)}.mp4")
+        generate_video(video_path, record["boxes"], clip_path, frame_width, frame_height, fps)
+        tracks.append((label, clip_path))
+
+    if disallowed_labels:
+        logger.info("Dropped tracks with disallowed labels: %s", sorted(disallowed_labels))
+    logger.info(
+        "Kept %d of %d tracks from %d frames of %s",
+        len(tracks),
+        len(track_records),
+        frame_count,
+        video_path,
+    )
+    return tracks
+
+
+def get_qwen_captions(video_path, label):
+    """Ask the Qwen2.5-VL service what `label` is doing in the clip, once per prompt."""
+    # One single-turn conversation per prompt, sent as one batch. The service substitutes the
+    # uploaded clip for the empty "file://" video URL.
+    messages = [
+        [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video",
+                        "video": "file://",
+                        "max_pixels": 360 * 420,
+                        "fps": 1.0,
+                    },
+                    {"type": "text", "text": prompt.format(object=label)},
+                ],
+            }
+        ]
+        for prompt in CAPTION_PROMPTS
     ]
 
-    # Compute disallowed (unique) labels
-    disallowed_labels = sorted({lab for lab in valid_labels if lab not in ALLOWED_LABELS})
-    print(f"Disallowed labels (not saved): {disallowed_labels}")
+    with open(video_path, "rb") as f:
+        resp = requests.post(
+            f"{QWEN_API_URL}/qwen",
+            data={"messages": json.dumps(messages), "is_batch": "true"},
+            files={"video": (os.path.basename(video_path), f, "video/mp4")},
+            timeout=120,
+        )
+    resp.raise_for_status()
+    return resp.json()["response"]
 
-    # Only keep tracks whose final label is allowed
-    allowed_tracks = {
-        track_id: record
-        for track_id, record in valid_tracks.items()
-        if record.get("final_label_text") in ALLOWED_LABELS
-    }
 
-    # Generate videos for each allowed track if folder is empty
-    if len(os.listdir(segment_output_dir)) == 0:
-        print("Generating videos for allowed tracks...")
-        for track_id, record in allowed_tracks.items():
-            label_name = record["final_label_text"]
-            video_path = os.path.join(segment_output_dir, f"{label_name}_{track_id}.mp4")
-            generate_video(
-                file_path, record, track_id, label_name, video_path, frame_width, frame_height, fps
+def caption_tracks(tracks):
+    """Caption each (label, clip_path) pair; a track whose captioning fails is left out."""
+    objects, captions = [], []
+    for label, clip_path in tracks:
+        try:
+            track_captions = get_qwen_captions(clip_path, label)
+        except (requests.RequestException, KeyError, ValueError) as e:
+            logger.warning(
+                "Captioning failed for %s (%s): %r", label, os.path.basename(clip_path), e
             )
-
-    print(f"Video processing complete. Individual track videos saved to {segment_output_dir}.")
-    return segment_output_dir
+            continue
+        objects.append(label)
+        captions.append(track_captions)
+    return objects, captions
 
 
 @app.route("/process_video", methods=["POST"])
 def process_video_api():
-    data = request.get_json()
-    print(data)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object."}), 400
     video_path = data.get("video_path")
     if not video_path:
         return jsonify({"error": "Missing 'video_path' in request data."}), 400
+    if not isinstance(video_path, str) or not os.path.isfile(video_path):
+        return jsonify({"error": "'video_path' must be an existing local file."}), 400
 
+    logger.info("Processing %s", video_path)
     try:
-        output_folder = process_video(model, device="cuda:0", file_path=video_path)
-        all_objects, all_captions, all_videos = process_folder_for_captions(output_folder)
-        response = {
-            "message": "Video processing complete.",
-            "objects": all_objects,
-            "captions": all_captions,
-            "videos": all_videos,
-        }
-        return jsonify(response)
+        with tempfile.TemporaryDirectory(prefix="objdet_") as out_dir:
+            tracks = process_video(model, DEVICE, video_path, out_dir)
+            objects, captions = caption_tracks(tracks)
     except Exception as e:
+        logger.exception("Failed to process %s", video_path)
         return jsonify({"error": str(e)}), 500
+    if tracks and not objects:
+        return jsonify({"error": "Captioning failed for every track."}), 502
 
-
-def get_qwen_batch_captions(video_path, objects: list):
-    url = f"http://localhost:{QWEN_PORT}/qwen"
-
-    prompts = [
-        "What is the {object} doing in the video? Please only provide a caption if there is a clear action.",
-        "Describe what the {object} is doing in the video. If there is no action, type 'no action'.",
-        "What is the {object} doing in the video? If no action is observed, type 'no action'.",
-    ]
-
-    vlm_captions = []
-
-    # Open once; re-use handle (rewind before each POST)
-    with open(video_path, "rb") as f:
-        for obj in objects:
-            questions = [p.format(object=obj) for p in prompts]
-
-            # Build a proper Python object (list of conversations), then JSON-encode it
-            # Shape here: batch of 3 conversations, each a one-turn list
-            messages_obj = [
-                [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "video",
-                                "video": "file://",
-                                "max_pixels": 360 * 420,
-                                "fps": 1.0,
-                            },
-                            {"type": "text", "text": q},
-                        ],
-                    }
-                ]
-                for q in questions
-            ]
-
-            payload = {"messages": json.dumps(messages_obj), "is_batch": "true"}
-
-            f.seek(0)
-            files = {"video": (os.path.basename(video_path), f, "video/mp4")}
-
-            resp = requests.post(url, data=payload, files=files, timeout=120)
-            resp.raise_for_status()
-            vlm_captions.append(resp.json()["response"])
-
-    return objects, vlm_captions
-
-
-def process_folder_for_captions(output_dir):
-    all_objects = []
-    all_captions = []
-    all_videos = []
-    print(output_dir)
-
-    for video_file in os.listdir(output_dir):
-        print(f"video file: {video_file}")
-        if video_file.endswith(".mp4"):
-            video_path = os.path.join(output_dir, video_file)
-            label_name = video_file.split("_")[0]
-
-            all_videos.append(video_path)
-            objects, captions = get_qwen_batch_captions(video_path, [label_name])
-            all_objects.extend(objects)
-            all_captions.append(captions[0])
-    print("all objects: ")
-    print(all_objects)
-    return all_objects, all_captions, all_videos
+    return jsonify(
+        {
+            "message": "Video processing complete.",
+            "objects": objects,
+            "captions": captions,
+            # The per-track clips only live for the duration of the request.
+            "videos": [],
+        }
+    )
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=17266, debug=True)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("CRELERI_HOST", "127.0.0.1"),
+        help="interface to bind (default: $CRELERI_HOST or 127.0.0.1)",
+    )
+    parser.add_argument("--port", type=int, default=17266, help="port (default: %(default)s)")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+    load_model()
+    # Requests share one model on one GPU, so serve them one at a time.
+    app.run(host=args.host, port=args.port, debug=False, threaded=False)
