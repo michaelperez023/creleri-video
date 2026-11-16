@@ -1,0 +1,54 @@
+cff-version: 1.2.0
+message: "If you use CReLeRI in your research, please cite the paper below."
+title: "CReLeRI: Explainable, Concept-centric, Representation, Learning, Reasoning, and Interaction Video Analysis System"
+repository-code: "https://github.com/michaelperez023/creleri-video"
+license: AGPL-3.0
+authors: &authors
+  - family-names: Perez
+    given-names: Michael Francis
+  - family-names: Yang
+    given-names: Yichi
+  - family-names: Zha
+    given-names: Yuheng
+  - family-names: Ma
+    given-names: Enze
+  - family-names: Tamboli
+    given-names: Danish
+  - family-names: Ma
+    given-names: Haodi
+  - family-names: Shahriari
+    given-names: Reza
+  - family-names: Pathak
+    given-names: Vyom
+  - family-names: Kasinets
+    given-names: Dzmitry
+  - family-names: Venkatakrishnan
+    given-names: Rohith
+  - family-names: Wang
+    given-names: Daisy Zhe
+  - family-names: Ruiz
+    given-names: Jaime
+  - family-names: Ragan
+    given-names: Eric D.
+  - family-names: Hu
+    given-names: Zhiting
+  - family-names: Xing
+    given-names: Eric
+  - family-names: Zhu
+    given-names: Jun-Yan
+preferred-citation:
+  type: conference-paper
+  title: "CReLeRI: Explainable, Concept-centric, Representation, Learning, Reasoning, and Interaction Video Analysis System"
+  authors: *authors
+  collection-title: "Proceedings of the 33rd ACM International Conference on Multimedia"
+  publisher:
+    name: Association for Computing Machinery
+  conference:
+    name: "MM '25"
+    city: Dublin
+    country: IE
+  year: 2025
+  start: 13528
+  end: 13530
+  doi: 10.1145/3746027.3754479
+  url: "https://doi.org/10.1145/3746027.3754479"
