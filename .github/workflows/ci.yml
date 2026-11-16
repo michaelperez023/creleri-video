@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+      - name: Ruff
+        run: |
+          uvx ruff@0.17.5 check .
+          uvx ruff@0.17.5 format --check .
+      - name: JavaScript syntax
+        run: for f in web_ui/static/js/*.js; do node --check "$f"; done
+      - name: Shell scripts
+        run: uvx --from shellcheck-py shellcheck scripts/*.sh
+
+  test:
+    name: Tests (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: web UI
+            path: web_ui/tests
+            deps: --with-requirements web_ui/requirements.txt
+          - name: segmentation service
+            path: adatad_temp_seg/tests
+            deps: >-
+              --with numpy==1.23.5 --with fastapi==0.162.5 --with starlette==1.7.0
+              --with celery==5.5.3 --with uvicorn==0.38.0 --with python-multipart==0.0.32
+              --with pydantic==2.12.3 --with httpx2
+          - name: VLM and LLM services
+            path: vlm_action_pipeline/demo_pipeline/tests
+            deps: --with flask==3.1.2 --with openai==1.109.1 --with python-dotenv==1.1.1 --with numpy
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+      - name: Run tests
+        run: uv run --no-project --python 3.10 --with pytest ${{ matrix.deps }} pytest ${{ matrix.path }} -q
