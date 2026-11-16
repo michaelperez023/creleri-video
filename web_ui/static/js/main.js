@@ -1,61 +1,39 @@
-function showVideoModal(){
-    document.getElementById('videoLoader').style.display = 'flex';
-    document.getElementById('videoLoader').style.flexDirection = 'row';
+function showVideoModal() {
+    const loader = document.getElementById('videoLoader');
+    loader.style.display = 'flex';
+    loader.style.flexDirection = 'row';
 }
 
-function hideVideoModal(){
+function hideVideoModal() {
     document.getElementById('videoLoader').style.display = 'none';
-    
 }
 
-function disableFileUploadButton() {
-    document.getElementById('file-label').classList.add('disabled'); 
-    document.getElementById('file-label').style.opacity = '0.5';
+// The paperclip label is the visible control, but the visually hidden input behind it is
+// still keyboard-focusable, so it is disabled as well. The segmentation mode is fixed per batch.
+function setUploadEnabled(enabled) {
+    const label = document.getElementById('file-label');
+    label.classList.toggle('disabled', !enabled);
+    label.style.opacity = enabled ? '1' : '0.5';
+    document.getElementById('file-upload').disabled = !enabled;
+    document.getElementById('segmentation-type-select').disabled = !enabled;
 }
 
-function enableFileUploadButton() {
-    document.getElementById('file-label').classList.remove('disabled'); 
-    document.getElementById('file-label').style.opacity = '1';
-}
+// Toggles the concept visualization box, or forces it open or closed with 'Expand' / 'Collapse'.
+function conceptVisualizationCollapsable(action) {
+    const box = document.getElementById('concept-visualization-box');
+    const button = document.getElementById('concept-visualization-collapsible-btn');
+    const expand = action ? action === 'Expand' : box.style.display !== '';
 
-function conceptVisualizationCollapsable(action){
-    conceptVisualizationBox = document.getElementById('concept-visualization-box');
-    const treeViewBtn = document.getElementById('tree-view-btn');
-    const essentialAttributesBtn = document.getElementById('essential-attributes-btn');
-    const leafNodesBtn = document.getElementById('leaf-nodes-btn');
-    const collapsiblebtn = document.getElementById('concept-visualization-collapsible-btn');
-
-    const buttons = [treeViewBtn, essentialAttributesBtn, leafNodesBtn];
-
-    if(action){
-        if(action === "Collapse"){
-            conceptVisualizationBox.style.display = 'none';
-            conceptVisualizationBox.classList.remove('expanded');
-            collapsiblebtn.innerHTML = '<span class="material-symbols-outlined"> expand_circle_down </span>'
-        }
-        else if(action === "Expand"){
-            conceptVisualizationBox.style.display = '';
-            conceptVisualizationBox.classList.add('expanded');
-            collapsiblebtn.innerHTML = '<span class="material-symbols-outlined"> expand_circle_up </span>'
-        }
-    }
-    else{
-        if(conceptVisualizationBox.style.display === ''){
-            conceptVisualizationBox.style.display = 'none';
-            conceptVisualizationBox.classList.remove('expanded');
-            collapsiblebtn.innerHTML = '<span class="material-symbols-outlined"> expand_circle_down </span>'
-        }
-        else{
-            conceptVisualizationBox.style.display = '';
-            conceptVisualizationBox.classList.add('expanded');
-            collapsiblebtn.innerHTML = '<span class="material-symbols-outlined"> expand_circle_up </span>'
-        }
-    }
+    box.style.display = expand ? '' : 'none';
+    box.classList.toggle('expanded', expand);
+    button.setAttribute('aria-expanded', String(expand));
+    button.querySelector('.material-symbols-outlined').textContent =
+        expand ? 'expand_circle_up' : 'expand_circle_down';
 }
 
 function displayMessage(message, className) {
-    var conversationArea = document.getElementById('conversation-area');
-    var messageDiv = document.createElement('div');
+    const conversationArea = document.getElementById('conversation-area');
+    const messageDiv = document.createElement('div');
     messageDiv.textContent = message;
     messageDiv.classList.add('chat-message', className);
     conversationArea.appendChild(messageDiv);
@@ -64,37 +42,10 @@ function displayMessage(message, className) {
 
 document.addEventListener('DOMContentLoaded', function () {
     document.getElementById('file-upload').addEventListener('change', handleFileUpload);
-    
-    document.getElementById('user-input').addEventListener('keyup', function() {
+
+    // Grow the message box with its content, up to four rows.
+    document.getElementById('user-input').addEventListener('keyup', function () {
         this.rows = 1;
-        this.rows = Math.min(4,this.scrollHeight/32);
-        if (event.key !== 'Enter') {
-            this.rows = 1;
-            this.rows = Math.min(4,this.scrollHeight/32);
-        }
-    }, false);
-
-    document.getElementById('segmentation-type-select').addEventListener('change', function () {
-        let selectedSegmentationType = this.value;
-        console.log("Selected segmentation type:", selectedSegmentationType);
-
-        // Send the selected port to the backend
-        fetch('/set_backend_segmentation_type', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({ segmentationType: selectedSegmentationType }),
-        })
-        .then(response => response.json())
-        .then(data => {
-            if (data.status === 'success') {
-                console.log('Segmentation type successfully updated:', data.type);
-            } else {
-                console.error('Failed to update segmentation type');
-            }
-        })
-        .catch(error => console.error('Error:', error));
+        this.rows = Math.min(4, this.scrollHeight / 32);
     });
-    
 });

@@ -1,135 +1,182 @@
-var OriginalVideoFiles= [];
-var FileCounter = 0;
+// Upload flow: each selected video is sent to /analyze_video, its segmentation task is polled
+// until it completes, and the results are drawn as a timeline with per-segment details whose
+// activity cards appear once the segment's grounding jobs finish.
+
+const TASK_POLL_MS = 5000;
+const GROUNDING_POLL_MS = 2000;
+const GROUNDING_TIMEOUT_MS = 10 * 60 * 1000;
+// Network errors and gateway errors, including the 503 the server sends while the segmentation
+// API is unreachable, are retried this many times in a row before polling gives up.
+const TRANSIENT_HTTP_STATUS = [502, 503, 504];
+const MAX_TRANSIENT_FAILURES = 12;
+
+let videoCounter = 0;
+let viewerUrl = null;
+let releaseViewer = null;
+let viewerGeneration = 0;
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+async function responseError(response, action) {
+    const body = await response.json().catch(() => ({}));
+    const message = body.detail || body.error;
+    return new Error(`${action} returned HTTP ${response.status}${message ? `: ${message}` : ''}`);
+}
 
 async function handleFileUpload(event) {
     const fileInput = event.target;
-    const files = Array.from(event.target.files);
-    const unique_file_types = [];
+    const files = Array.from(fileInput.files);
+    const videos = files.filter(file => file.type.startsWith('video/'));
+    const skipped = files.filter(file => !file.type.startsWith('video/'));
 
-    // Identify unique file types asynchronously
-    for (const file of files) {
-        if (file.type.startsWith('video/') && !unique_file_types.includes('video')) {
-            unique_file_types.push('video');
-        } else if (file.type.startsWith('image/') && !unique_file_types.includes('image')) {
-            unique_file_types.push('image');
-        }
+    if (skipped.length > 0) {
+        const names = skipped.map(file => file.name).join(', ');
+        displayMessage(`Skipped ${names}: only video files are supported.`, 'system-message');
+    }
+    if (videos.length === 0) {
+        fileInput.value = '';
+        return;
     }
 
-    // Check if no files are selected or if invalid file conditions are met
-    if (files.length === 0 || 
-        unique_file_types.length > 1 || 
-        (files[0].type.startsWith('image/') && files.length > 1)) {
-        enableFileUploadButton();
-        return; // Exit if no files or invalid file conditions
-    }
-
-    if (files[0].type.startsWith('video/')) {
-        displayMessage("Your videos are being processed. Results will appear in the concept visualization box as soon as they're ready.", 'system-message');
-        // Multiple video uploads
-        for (let index = 0; index < files.length; index++) {
-            const file = files[index];
-            
-            if (file.type.startsWith('video/')) {
-                const formData = new FormData();
-                formData.append('file', file);
-                
-                conceptVisualizationCollapsable("Expand");
-                document.getElementById('video-processing-counter').innerHTML = `Processing Video ${index +1} / ${files.length}`;
-                await uploadVideoFile(formData, file); // Await each video upload
-                await displayVideoPreview(file);
-
-                displayMessage(`Video ${index + 1} of ${files.length} processed.`, 'system-message');
-            }
-        }
-    } else {
-        console.error('Unsupported file type selected.');
-    }
-    document.getElementById('video-processing-counter').innerHTML = ``;
-    fileInput.value = '';
-}
-
-async function uploadVideoFile(formData, file) {
-    disableFileUploadButton();
+    // Read once so that changing the dropdown mid-batch cannot mix modes within a batch.
+    const segmentationType = document.getElementById('segmentation-type-select').value;
+    const counter = document.getElementById('video-processing-counter');
+    setUploadEnabled(false);
     showVideoModal();
-    
-    console.log(`file(s) uploaded at ${new Date().toLocaleString()}`);
+    displayMessage("Your videos are being processed. Results will appear in the concept visualization box as soon as they're ready.", 'system-message');
 
     try {
-        const response = await fetch('/analyze_video', {
-            method: 'POST',
-            body: formData,
-        });
-
-        if (!response.ok) {
-            throw new Error(`Error uploading video: ${response.statusText}`);
-        }
-
-        const { task_id } = await response.json();
-
-        let taskStatus = 'Processing';
-        while (taskStatus === 'Processing') {
-            await new Promise(resolve => setTimeout(resolve, 5000)); // Wait for 5 seconds
-            const statusResponse = await fetch(`/task_status/${task_id}`);
-            const statusResult = await statusResponse.json();
-            taskStatus = statusResult.status;
-            if (taskStatus === 'Completed') {
-                console.log('Received response from server:', statusResult);
-                await handleVideoUploadSuccess(statusResult, file);
-                console.log('Success in handleVideoUploadSuccess:', statusResult);
-            } else if (taskStatus === 'Failed') {
-                throw new Error(`Video processing failed: ${statusResult.error}`);
+        for (const [index, file] of videos.entries()) {
+            const label = `Video ${index + 1} of ${videos.length}`;
+            conceptVisualizationCollapsable('Expand');
+            counter.textContent = `Processing Video ${index + 1} / ${videos.length}`;
+            try {
+                const status = await uploadVideoFile(file, segmentationType);
+                await renderVideoResults(status.result, file);
+                await displayVideoPreview(file);
+                displayMessage(`${label} processed.`, 'system-message');
+            } catch (error) {
+                console.error(`Processing ${file.name} failed:`, error);
+                displayMessage(`${label} (${file.name}) failed: ${error.message}`, 'system-message');
             }
         }
-
-        return;
-    } catch (error) {
-        console.error('Error in uploadVideoFile:', error);
-        throw error;
-
     } finally {
-        console.log(`uploadVideoFile finished at ${new Date().toLocaleString()}`);
-        
-        enableFileUploadButton();
+        counter.textContent = '';
         hideVideoModal();
+        setUploadEnabled(true);
+        fileInput.value = '';
     }
 }
 
-async function handleVideoUploadSuccess(response, file) {
-    console.log('Video uploaded successfully', response);
-    OriginalVideoFiles.push(file);
-
-    // Ensure response has the expected structure
-    if (!response || response.status !== 'Completed' || !response.result) {
-        console.error('Unexpected response format', response);
-        displayMessage("Error processing video: Invalid response format.", 'system-message');
-        hideModal();
-        return;
+// Upload one video and wait for its segmentation task; resolves to the completed task status.
+async function uploadVideoFile(file, segmentationType) {
+    const maxBytes = Number(document.getElementById('file-upload').dataset.maxBytes);
+    if (file.size > maxBytes) {
+        throw new Error(`the file is larger than the ${Math.floor(maxBytes / 2 ** 20)} MB upload limit`);
     }
 
-    const { proposals, results: segments_pred_data, thumbnails } = response.result;
-
-    if (!proposals || !segments_pred_data || !thumbnails) {
-        console.error('Missing data in response', response);
-        displayMessage("Error processing video: Missing data in response.", 'system-message');
-        hideModal();
-        return;
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('segmentation_type', segmentationType);
+    const response = await fetch('/analyze_video', { method: 'POST', body: formData });
+    if (!response.ok) {
+        throw await responseError(response, 'Upload');
+    }
+    const { task_id: taskId } = await response.json();
+    if (!taskId) {
+        throw new Error('the server did not return a task id');
     }
 
+    let failures = 0;
+    while (true) {
+        await sleep(TASK_POLL_MS);
+        let statusResponse;
+        try {
+            statusResponse = await fetch(`/task_status/${encodeURIComponent(taskId)}`);
+        } catch (error) {
+            // The task keeps running while this server restarts or a tunnel to it reconnects.
+            if (++failures <= MAX_TRANSIENT_FAILURES) continue;
+            throw error;
+        }
+        if (!statusResponse.ok) {
+            if (TRANSIENT_HTTP_STATUS.includes(statusResponse.status) && ++failures <= MAX_TRANSIENT_FAILURES) {
+                continue;
+            }
+            throw await responseError(statusResponse, 'Status check');
+        }
+        failures = 0;
+        const status = await statusResponse.json();
+        if (status.status === 'Completed') {
+            return status;
+        }
+        if (status.status === 'Failed') {
+            throw new Error(`video processing failed: ${status.error}`);
+        }
+        if (status.status !== 'Processing') {
+            throw new Error(`unexpected task status: ${status.status}`);
+        }
+    }
+}
+
+// Segment times reach the page through several JSON paths, so compare them with a tolerance.
+function sameSpan(a, b) {
+    const EPS = 1e-2;
+    return Array.isArray(a) && Math.abs(a[0] - b[0]) < EPS && Math.abs(a[1] - b[1]) < EPS;
+}
+
+// The timeline is scaled to the video's duration. The browser cannot decode every container
+// the backend accepts, so fall back to the end of the last segment.
+async function videoDuration(file, fallback) {
+    const url = URL.createObjectURL(file);
+    const probe = document.createElement('video');
+    probe.preload = 'metadata';
+    try {
+        return await new Promise(resolve => {
+            probe.onloadedmetadata = () =>
+                resolve(Number.isFinite(probe.duration) && probe.duration > 0 ? probe.duration : fallback);
+            probe.onerror = () => resolve(fallback);
+            probe.src = url;
+        });
+    } finally {
+        URL.revokeObjectURL(url);
+    }
+}
+
+function clearSegmentHighlight() {
+    d3.selectAll("rect")
+        .attr("stroke", "none")
+        .attr("stroke-width", 0)
+        .style("fill-opacity", 1.0);
+}
+
+// Make a clickable element reachable with Tab and operable with Enter or Space, like a button.
+function activateWithKeyboard(selection) {
+    selection
+        .attr("tabindex", 0)
+        .attr("role", "button")
+        .on("keydown", function (event) {
+            if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                this.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+            }
+        });
+}
+
+async function renderVideoResults(result, file) {
+    const { proposals, results: segmentPredictions, thumbnails } = result ?? {};
+    if (!proposals || !segmentPredictions || !thumbnails) {
+        throw new Error('the server response is missing results');
+    }
     const videoPaths = Object.keys(proposals);
     if (videoPaths.length === 0) {
-        console.error('No proposals found');
-        displayMessage("Error processing video: No proposals found.", 'system-message');
-        hideModal();
-        return;
+        throw new Error('no segments were proposed');
     }
-    const videoPath = videoPaths[0];
-    const segments = proposals[videoPath];
+    const segments = proposals[videoPaths[0]].filter(
+        s => Array.isArray(s?.segment) && s.segment.length === 2
+    );
 
-    const videoID = `video-container-${FileCounter}`; // Unique ID for this video container
-    const currentFileIndex = FileCounter; // Preserve current file index for later
-    FileCounter++; // Increment for the next video
+    const videoID = `video-container-${videoCounter++}`;
 
-    // Create a new div for the video
     const conceptBox = d3.select("#concept-visualization-box");
     const videoContainer = conceptBox.append("div")
         .attr("class", "video-container")
@@ -150,7 +197,9 @@ async function handleVideoUploadSuccess(response, file) {
     header.append("strong").text(`Video: ${file.name}`);
 
     const collapseButton = header.append("button")
-        .html(`<span class="material-symbols-outlined">expand_circle_up</span>`)
+        .attr("aria-label", `Results for ${file.name}`)
+        .attr("aria-expanded", "true")
+        .html(`<span class="material-symbols-outlined" aria-hidden="true">expand_circle_up</span>`)
         .style("margin-left", "auto")
         .style("border", "none")
         .style("background", "transparent")
@@ -158,75 +207,45 @@ async function handleVideoUploadSuccess(response, file) {
             const content = d3.select(`#${videoID} .video-content`);
             const isCollapsed = content.style("display") === "none";
             content.style("display", isCollapsed ? "block" : "none");
-            collapseButton.html(isCollapsed ? `<span class="material-symbols-outlined">expand_circle_up</span>` : `<span class="material-symbols-outlined">expand_circle_down</span>`);
+            collapseButton.attr("aria-expanded", String(isCollapsed));
+            collapseButton.select("span").text(isCollapsed ? "expand_circle_up" : "expand_circle_down");
         });
 
-    // Content section
     const contentSection = videoContainer.append("div")
         .attr("class", "video-content")
         .style("padding", "10px");
 
-    // Link to play the original video
-    const originalVideoLink = contentSection.append("a")
+    contentSection.append("a")
         .text("Click Here for Original Video")
         .attr("href", "#")
         .attr("class", "original-video-link")
         .style("display", "block")
         .style("margin-bottom", "10px")
-        .node();
+        .on("click", event => {
+            event.preventDefault();
+            displayVideoPreview(file);
+            clearSegmentHighlight();
+        });
 
-    originalVideoLink.dataset.fileIndex = currentFileIndex; // Store the file index
-    originalVideoLink.addEventListener("click", function (event) {
-        event.preventDefault();
-        displayVideoPreview(OriginalVideoFiles[originalVideoLink.dataset.fileIndex]);
-        
-        d3.selectAll("rect")
-        .attr("stroke", "none")
-        .attr("stroke-width", 0)
-        .style("fill-opacity", 1.0);
-    });
-
-    // Calculate the duration of the video
-    const videoElement = document.createElement("video");
-    const videoURL = URL.createObjectURL(file);
-
-    const duration = await new Promise((resolve, reject) => {
-        videoElement.src = videoURL;
-        videoElement.preload = "metadata";
-
-        videoElement.onloadedmetadata = () => {
-            resolve(videoElement.duration);
-            URL.revokeObjectURL(videoURL); // Clean up the URL
-        };
-
-        videoElement.onerror = (e) => {
-            reject("Error loading video metadata: " + e);
-        };
-    });
-
-    console.log(`Calculated Video Duration: ${duration}s`);
+    const duration = await videoDuration(file, Math.max(1, ...segments.map(s => s.segment[1])));
 
     // Timeline dimensions
     const timelineWidth = 1000;
     const timelineHeight = 40;
     const timelineMargin = 5;
 
-    // SVG container for the timeline
     const timelineContainer = contentSection.append("svg")
         .attr("width", timelineWidth)
         .attr("height", timelineHeight)
         .style("background", "#000")
         .style("margin-bottom", "20px");
 
-    // Generate unique colors for segment overlays
     const segmentColors = segments.map(() =>
         `hsl(${Math.random() * 360}, 70%, 50%)`
     );
 
-    // Draw segment markers
-    const segmentsGroup = timelineContainer.append("g");
-
-    segmentsGroup.selectAll("rect")
+    timelineContainer.append("g")
+        .selectAll("rect")
         .data(segments)
         .enter()
         .append("rect")
@@ -238,197 +257,160 @@ async function handleVideoUploadSuccess(response, file) {
         .attr("stroke", "none")
         .attr("stroke-width", 0)
         .style("cursor", "pointer")
-        .attr("data-segment-index", (_, i) => i);
+        .attr("data-segment-index", (_, i) => i)
+        .attr("aria-label", d => `Segment ${d.segment[0].toFixed(2)}s - ${d.segment[1].toFixed(2)}s`)
+        .call(activateWithKeyboard)
+        .on("click", function () {
+            const index = this.getAttribute("data-segment-index");
+            contentSection.selectAll(".segment-details").style("display", "none");
+            contentSection.select(`.segment-details-${index}`).style("display", "block");
 
-    console.log('Segments:', segments);
-    console.log('Thumbnails:', thumbnails);
+            clearSegmentHighlight();
+            d3.select(this)
+                .attr("stroke", "#fff")
+                .attr("stroke-width", 1)
+                .style("fill-opacity", 0.5);
+        });
 
-    const segmentDataList = segments.map((segment, index) => {
-      // tolerate small float drift when matching by times
-      const EPS = 1e-2;
-      let matchingThumbnail = thumbnails.find(t =>
-        t.segment && segment.segment &&
-        Math.abs(t.segment[0] - segment.segment[0]) < EPS &&
-        Math.abs(t.segment[1] - segment.segment[1]) < EPS
-      );
-
-      // fallback by index if no time match
-      if (!matchingThumbnail) matchingThumbnail = thumbnails[index] || null;
-
-      const segment_pred_data = segments_pred_data[index];
-
-      return {
-        segment,
-        thumbnail_url: matchingThumbnail?.thumbnail_url ?? null,
-        segment_pred_data,
-      };
-    });
-
-    // Pre-generate segment details for each segment
-    for (const [index, segmentData] of segmentDataList.entries()) {
-        const segment = segmentData.segment;
-        const thumbnail_url = segmentData.thumbnail_url;
-        const segment_pred_data = segmentData.segment_pred_data;
+    // Lay out every segment's details first so any segment can be opened right away; activity
+    // cards are filled in as each segment's grounding jobs finish.
+    const pending = segments.map((segment, index) => {
+        const [start, end] = segment.segment;
+        const thumbnail = thumbnails.find(t => sameSpan(t.segment, segment.segment));
 
         const detailsContainer = contentSection.append("div")
             .attr("class", `segment-details segment-details-${index}`)
             .style("margin-top", "20px")
             .style("display", "none");
 
-        const start = segment.segment[0];
-        const end = segment.segment[1];
-
-        if (segment.segment && segment.segment.length === 2) {
-            detailsContainer.append("h4")
-                .text(`Segment: ${start.toFixed(2)}s - ${end.toFixed(2)}s`);
-        } else {
-            detailsContainer.append("h4").text("Invalid Segment Data");
-            continue;
-        }
+        detailsContainer.append("h4")
+            .text(`Segment: ${start.toFixed(2)}s - ${end.toFixed(2)}s`);
 
         const segmentInfo = detailsContainer.append("div")
             .style("display", "flex")
             .style("flex-direction", "row")
             .style("gap", "15px");
 
-        // Thumbnail container
         const thumbnailContainer = segmentInfo.append("div");
-
-        // Display the thumbnail image
-        if (thumbnail_url) {
+        if (thumbnail?.thumbnail_url) {
             thumbnailContainer.append("img")
-                .attr("src", thumbnail_url)
+                .attr("src", thumbnail.thumbnail_url)
                 .attr("alt", `Thumbnail for segment ${index}`)
                 .style("max-width", "200px")
                 .style("display", "block")
                 .style("margin-bottom", "10px")
                 .style("cursor", "pointer")
-                .on("click", () => {
-                    // When the thumbnail is clicked, seek the video to the start of the segment
-                    displayVideoPreview(OriginalVideoFiles[originalVideoLink.dataset.fileIndex]);
-                    seekVideoTo(start);
-                    let videoElement = document.getElementById('media-video');
-
-                    videoElement.addEventListener('timeupdate', () => {
-                        if (videoElement.currentTime > end) {
-                            videoElement.currentTime = start;
-                            videoElement.play();
-                        }
-                    });
-                });
+                .call(activateWithKeyboard)
+                .on("click", () => playSegment(file, start, end));
         } else {
             thumbnailContainer.append("div")
                 .text("No thumbnail available")
                 .style("margin-bottom", "10px");
         }
 
-        // Action info container
         const actionInfoContainer = segmentInfo.append("div")
             .style("display", "flex")
             .style("flex-direction", "row")
             .style("gap", "10px");
 
-        if (!segment_pred_data || !segment_pred_data.results) {
-            actionInfoContainer.append("div").text("No activity predictions for this segment.");
-            continue;
-        }
+        // The worker skips segments it cannot cut, so predictions are matched by time, not index.
+        const prediction = segmentPredictions.find(p => sameSpan(p.segment?.segment, segment.segment));
+        return { actionInfoContainer, prediction };
+    });
 
-        // Process the predictions and attach job ids to each action
-        const api_responses = segment_pred_data.api_response || [];
-        let api_index = 0;
-
-        for (const action_key in (segment_pred_data.results || {})) {
-            segment_pred_data.results[action_key].forEach((action) => {
-            if (api_index < api_responses.length) {
-                action.video_api_id = api_responses[api_index];
-                api_index++;
-            }
-            });
-        }
-        
-        const allActions = Object.values(segment_pred_data.results || {}).flat();
-        allActions.sort((a, b) => b.probability - a.probability);
-        
-        const jobIds = allActions.map(a => a.video_api_id).filter(Boolean);
-        if (jobIds.length === 0) {
-            actionInfoContainer.append("div").text("No activity predictions for this segment.");
-            continue;
-        }
-        
-        const statusMap = await waitAllJobs(jobIds, { pollMs: 2000, timeoutMs: 10 * 60 * 1000 });
-        
-        const any_valid = jobIds.some(id => statusMap[id]?.status === "SUCCESS_VALID");
-        if (!any_valid) {
-            actionInfoContainer.append("div").text("No activity predictions for this segment.");
-            continue;
-        }
-
-        let found_valid_prediction = false;
-        let action_counter = 0;
-        
-        for (const actionData of allActions) {
-            const state = statusMap[actionData.video_api_id];
-            if (!state) continue;
-
-            const confidence = actionData.probability >= 0.67 ? 'high'
-                            : actionData.probability > 0.33 ? 'medium'
-                            : 'low';
-            const confidenceColor = getConfidenceColor(confidence);
-
-            const { status: Action_Status, hasVisualization } = state;
-
-            if (actionData && hasVisualization && (Action_Status === "SUCCESS_VALID" || !found_valid_prediction)) {
-                action_counter++;
-
-                const actionInfo = actionInfoContainer.append("div")
-                    .style("margin-bottom", "10px")
-                    .style("cursor", "pointer")
-                    .style("border", "solid")
-                    .style("border-radius", "5px")
-                    .style("padding", "10px 20px")
-                    .style("max-width", "250px")
-                    .on("click", () => {
-                        displaySegmentActivityPredictionVideo(actionData.video_api_id);
-                    });
-
-                actionInfo.html(`
-                  <div><strong>Activity Prediction:</strong> ${action_counter}</div>
-                  <div><strong>Activity:</strong> ${Action_Status === "SUCCESS_VALID" ? actionData.pattern.action : "I don't know"}</div>
-                `);
-
-                for (const [key, value] of Object.entries(actionData.pattern)) {
-                    if (key !== "action") {
-                    actionInfo.append("div").html(`<strong>${key}:</strong> ${value}`);
-                    }
-                }
-
-                if (Action_Status === "SUCCESS_VALID") {
-                    actionInfo.append("div").html(
-                        `<strong>Confidence:</strong> <span style="color:${confidenceColor};">${confidence.charAt(0).toUpperCase() + confidence.slice(1)}</span>`
-                    );
-                    found_valid_prediction = true;
-                }
-            }
-        }
-
-        // Add click handlers to toggle visibility
-        segmentsGroup.selectAll("rect").on("click", function () {
-            const index = d3.select(this).attr("data-segment-index");
-            contentSection.selectAll(".segment-details").style("display", "none");
-            contentSection.select(`.segment-details-${index}`).style("display", "block");
-
-            d3.selectAll("rect")
-            .attr("stroke", "none")
-            .attr("stroke-width", 0)
-            .style("fill-opacity", 1.0);
-
-            // Highlight the clicked rectangle
-            d3.select(this)
-            .attr("stroke", "#fff")
-            .attr("stroke-width", 1)
-            .style("fill-opacity", 0.5);
-        });
+    const groundingDeadline = Date.now() + GROUNDING_TIMEOUT_MS;
+    for (const { actionInfoContainer, prediction } of pending) {
+        await renderActivityPredictions(actionInfoContainer, prediction, groundingDeadline);
     }
+}
+
+async function renderActivityPredictions(container, prediction, deadline) {
+    if (prediction?.error) {
+        container.append("div").text("Analysis of this segment failed.");
+        return;
+    }
+    if (!prediction || !prediction.results) {
+        container.append("div").text("No activity predictions for this segment.");
+        return;
+    }
+
+    // Grounding job ids come back in the order the worker walked the parsed actions.
+    const jobIds = prediction.api_response || [];
+    const actions = Object.values(prediction.results)
+        .flat()
+        .map((action, i) => ({ ...action, jobId: jobIds[i] }))
+        .sort((a, b) => b.probability - a.probability);
+
+    const ids = actions.map(a => a.jobId).filter(Boolean);
+    if (ids.length === 0) {
+        container.append("div").text("No activity predictions for this segment.");
+        return;
+    }
+
+    const statusMap = await waitAllJobs(ids, deadline);
+    const statuses = ids.map(id => statusMap[id].status);
+    if (!statuses.includes("SUCCESS_VALID")) {
+        container.append("div").text(missingPredictionsNote(statuses));
+        return;
+    }
+
+    let foundValidPrediction = false;
+    let actionCounter = 0;
+    for (const action of actions) {
+        const state = statusMap[action.jobId];
+        if (!state || !state.hasVisualization) continue;
+        const valid = state.status === "SUCCESS_VALID";
+        if (!valid && foundValidPrediction) continue;
+
+        actionCounter++;
+        const card = container.append("div")
+            .style("margin-bottom", "10px")
+            .style("cursor", "pointer")
+            .style("border", "solid")
+            .style("border-radius", "5px")
+            .style("padding", "10px 20px")
+            .style("max-width", "250px")
+            .call(activateWithKeyboard)
+            .on("click", () => displaySegmentActivityPredictionVideo(action.jobId));
+
+        appendField(card, "Activity Prediction", actionCounter);
+        appendField(card, "Activity", valid ? action.pattern.action : "I don't know");
+        for (const [key, value] of Object.entries(action.pattern)) {
+            if (key !== "action") {
+                appendField(card, key, value);
+            }
+        }
+
+        if (valid) {
+            const confidence = action.probability >= 0.67 ? 'high'
+                            : action.probability > 0.33 ? 'medium'
+                            : 'low';
+            const label = confidence.charAt(0).toUpperCase() + confidence.slice(1);
+            appendField(card, "Confidence", label)
+                .select("span")
+                .style("color", getConfidenceColor(confidence));
+            foundValidPrediction = true;
+        }
+    }
+}
+
+// Why a segment has no activity cards. Only claim that nothing was found when every grounding
+// job returned a result, so that a service failure does not read as an empty prediction.
+function missingPredictionsNote(statuses) {
+    if (statuses.includes("ERROR")) return "Grounding results for this segment could not be loaded.";
+    if (statuses.includes("EXCEPTION")) return "Grounding failed for this segment.";
+    if (statuses.includes("TIMEOUT")) return "Timed out waiting for grounding results.";
+    if (statuses.includes("NOT_FOUND")) return "Grounding results for this segment have expired.";
+    return "No activity predictions for this segment.";
+}
+
+// One "label: value" line of an activity card. Keys and values are model output, so they are
+// inserted as text, never as HTML.
+function appendField(card, label, value) {
+    const line = card.append("div");
+    line.append("strong").text(`${label}:`);
+    line.append("span").text(` ${value}`);
+    return line;
 }
 
 // Helper function to get color based on confidence level
@@ -444,92 +426,112 @@ function getConfidenceColor(confidence) {
     }
 }
 
-// Function to seek video to the specified time
-function seekVideoTo(time) {
+// Play the original video looped over one segment.
+function playSegment(file, start, end) {
+    displayVideoPreview(file);
     const videoElement = document.getElementById('media-video');
-    if (videoElement) {
-        videoElement.currentTime = time;
-        videoElement.play();  // Automatically play after seeking
-    }
-}
-
-async function displayVideoPreview(file) {
-    return new Promise((resolve, reject) => {
-        const mediaContainer = document.getElementById('media-player');
-        const videoElement = document.createElement('video');
-        videoElement.id = 'media-video';
-        videoElement.src = URL.createObjectURL(file);
-        videoElement.controls = true;
-        videoElement.style.width = '100%';
-        videoElement.style.height = '380px';
-        videoElement.style.objectFit = 'contain';
-        videoElement.autoplay = true;
-        videoElement.loop = true;
-
-        // Listen for the 'loadeddata' event to ensure the video is ready
-        videoElement.addEventListener('loadeddata', () => {
-            resolve();  // Resolve the promise when the video is ready
-        });
-
-        // Handle any potential loading errors
-        videoElement.addEventListener('error', (error) => {
-            reject(error);  // Reject the promise on load error
-        });
-
-        // Replace the existing video or append a new one
-        const existingMediaVideo = document.getElementById('media-video');
-        if (existingMediaVideo) {
-            existingMediaVideo.replaceWith(videoElement);
-        } else {
-            mediaContainer.appendChild(videoElement);
+    videoElement.currentTime = start;
+    videoElement.addEventListener('timeupdate', () => {
+        // The player loops the whole file, so also catch the wrap back to 0 that the last
+        // segment hits before its end time is ever exceeded.
+        const t = videoElement.currentTime;
+        if (t >= end - 0.05 || t < start - 0.25) {
+            videoElement.currentTime = start;
         }
     });
 }
 
-async function displaySegmentActivityPredictionVideo(video_uuid) {
-    try {
-        const response = await fetch(`/video/get_result/${video_uuid}`, {
-            method: 'GET'
+// Show a File or Blob in the media viewer, replacing whatever is there. Resolves once the
+// video can play, once it fails to decode (reported to the user), or once it is replaced.
+function displayVideoPreview(source) {
+    viewerGeneration++;
+    releaseViewer?.();
+    if (viewerUrl) {
+        URL.revokeObjectURL(viewerUrl);
+    }
+    viewerUrl = URL.createObjectURL(source);
+
+    const videoElement = document.createElement('video');
+    videoElement.id = 'media-video';
+    videoElement.src = viewerUrl;
+    videoElement.controls = true;
+    videoElement.style.width = '100%';
+    videoElement.style.height = '380px';
+    videoElement.style.objectFit = 'contain';
+    videoElement.autoplay = true;
+    videoElement.loop = true;
+
+    const settled = new Promise(resolve => {
+        releaseViewer = resolve;
+        videoElement.addEventListener('loadeddata', () => resolve());
+        videoElement.addEventListener('error', () => {
+            if (videoElement.isConnected) {
+                displayMessage(`This browser cannot play ${source.name ?? 'the selected video'}.`, 'system-message');
+            }
+            resolve();
         });
+    });
 
-        // Check if the response is okay (status 200)
+    const existingMediaVideo = document.getElementById('media-video');
+    if (existingMediaVideo) {
+        existingMediaVideo.replaceWith(videoElement);
+    } else {
+        document.getElementById('media-player').appendChild(videoElement);
+    }
+    return settled;
+}
+
+async function displaySegmentActivityPredictionVideo(jobId) {
+    const generation = ++viewerGeneration;
+    try {
+        const response = await fetch(`/video/get_result/${encodeURIComponent(jobId)}`);
         if (!response.ok) {
-            throw new Error(`HTTP error! Status: ${response.status}`);
+            throw await responseError(response, 'The activity video request');
         }
-
-        // Convert the response to a blob
         const blob = await response.blob();
-
-        // Call displayVideoPreview with the video URL
-        displayVideoPreview(blob);
+        // A slow download must not replace something the user has selected since.
+        if (generation === viewerGeneration) {
+            await displayVideoPreview(blob);
+        }
     } catch (error) {
-        console.error('Error fetching segmented video:', error);
-        return null;
+        displayMessage(`Could not load the activity video: ${error.message}`, 'system-message');
     }
 }
 
-// Poll until the job leaves PENDING (or times out)
-async function waitJobUntilDone(jobId, {pollMs = 2000, timeoutMs = 10 * 60 * 1000} = {}) {
-  const deadline = Date.now() + timeoutMs;
-  while (true) {
-    const res = await fetch(`/video/result/${jobId}`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    const status = data.status;                 // "PENDING", "SUCCESS_VALID", "SUCCESS_INVALID", "EXCEPTION", "CANCELLED"
-    const hasVisualization = data.has_visualization;
-
-    if (status !== "PENDING") return {status, hasVisualization};
-    if (Date.now() > deadline) return {status: "TIMEOUT", hasVisualization: false};
-
-    await new Promise(r => setTimeout(r, pollMs));
-  }
+// Poll one grounding job until it leaves PENDING. Never throws, so one expired or failing job
+// cannot stop the rest of the video from rendering.
+async function waitForGroundingJob(jobId, deadline) {
+    let failures = 0;
+    while (true) {
+        try {
+            const response = await fetch(`/video/result/${encodeURIComponent(jobId)}`);
+            if (response.ok) {
+                failures = 0;
+                const job = await response.json();
+                if (job.status !== "PENDING") {
+                    return { status: job.status, hasVisualization: job.has_visualization };
+                }
+            } else if (response.status === 404) {
+                // The grounding service forgets jobs when it restarts or once their results expire.
+                return { status: "NOT_FOUND", hasVisualization: false };
+            } else if (!TRANSIENT_HTTP_STATUS.includes(response.status) || ++failures > MAX_TRANSIENT_FAILURES) {
+                return { status: "ERROR", hasVisualization: false };
+            }
+        } catch (error) {
+            if (++failures > MAX_TRANSIENT_FAILURES) {
+                return { status: "ERROR", hasVisualization: false };
+            }
+        }
+        if (Date.now() > deadline) {
+            return { status: "TIMEOUT", hasVisualization: false };
+        }
+        await sleep(GROUNDING_POLL_MS);
+    }
 }
 
-// Batch helper to resolve a set of IDs concurrently
-async function waitAllJobs(jobIds, opts) {
-  const uniq = Array.from(new Set(jobIds.filter(Boolean)));
-  const pairs = await Promise.all(
-    uniq.map(async id => [id, await waitJobUntilDone(id, opts)])
-  );
-  return Object.fromEntries(pairs); // return a POJO so statusMap[id] works
+// Resolve a set of job ids concurrently into {jobId: {status, hasVisualization}}.
+async function waitAllJobs(jobIds, deadline) {
+    const unique = Array.from(new Set(jobIds));
+    const states = await Promise.all(unique.map(id => waitForGroundingJob(id, deadline)));
+    return Object.fromEntries(unique.map((id, i) => [id, states[i]]));
 }
