@@ -1,12 +1,11 @@
+# Adapted from OpenTAD's opentad/cores/test_engine.py (Apache-2.0) for single-video inference.
 import os
 import copy
-import json
 import tqdm
 import torch
 
 from opentad.utils import create_folder
 from opentad.models.utils.post_processing import build_classifier, batched_nms
-from opentad.evaluations import build_evaluator
 from opentad.datasets.base import SlidingWindowDataset
 
 def move_to_device(batch, device):
@@ -23,15 +22,13 @@ def eval_one_epoch_single_video(
     test_loader,
     model,
     cfg,
-    logger=None,
     rank=0,
     model_ema=None,
     use_amp=False,
     world_size=1,
-    not_eval=False,
     device=torch.device('cpu')
 ):
-    """Inference and Evaluation the model"""
+    """Run inference and return the detections as dict(results={video_name: [...]})."""
 
     # load the ema dict for evaluation
     if model_ema != None:
@@ -57,9 +54,9 @@ def eval_one_epoch_single_video(
     result_dict = {}
     for data_dict in tqdm.tqdm(test_loader, disable=(rank != 0)):
         data_dict = move_to_device(data_dict, device)
-        
+
         with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
-            with torch.inference_mode(): 
+            with torch.inference_mode():
                 results = model(
                     **data_dict,
                     return_loss=False,
@@ -82,20 +79,7 @@ def eval_one_epoch_single_video(
         model.load_state_dict(current_dict)
 
     if rank == 0:
-        result_eval = dict(results=result_dict)
-        #if cfg.post_processing.save_dict:
-        #    result_path = os.path.join(cfg.work_dir, "result_detection.json")
-        #    with open(result_path, "w") as out:
-        #        json.dump(result_eval, out)
-        return result_eval
-
-        if not not_eval:
-            # build evaluator
-            evaluator = build_evaluator(dict(prediction_filename=result_eval, **cfg.evaluation))
-            # evaluate and output
-            logger.info("Evaluation starts...")
-            metrics_dict = evaluator.evaluate()
-            evaluator.logging(logger)
+        return dict(results=result_dict)
 
 def gather_ddp_results(world_size, result_dict, post_cfg):
     # do nms for sliding window, if needed

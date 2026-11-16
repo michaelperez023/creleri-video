@@ -1,3 +1,4 @@
+# Modified from OpenTAD (https://github.com/sming256/OpenTAD), Apache-2.0: copy of configs/adatad/thumos/e2e_thumos_videomae_s_768x1_160_adapter.py with local _base_ files, save_dict=True and an empty work_dir.
 _base_ = [
     "e2e_train_trunc_test_sw_256x224x224-inference.py",  # dataset config
     "actionformer-inference.py",  # model config

@@ -1,3 +1,4 @@
+# Modified from OpenTAD (https://github.com/sming256/OpenTAD), Apache-2.0: copy of configs/adatad/thumos/e2e_thumos_videomaev2_g_768x2_224_adapter.py with only the test pipeline, a local _base_ and no backbone pretrain.
 _base_ = ["e2e_thumos_videomae_s_768x1_160_adapter-inference.py"]
 
 window_size = 768
@@ -33,7 +34,7 @@ model = dict(
             adapter_index=list(range(20, 40)),
         ),
         custom=dict(
-pretrain="./vit-giant-p14_videomaev2-hybrid_pt_1200e_k710_ft_my.pth",
+            pretrain=None,  # every weight, backbone included, is loaded from best.pth
             pre_processing_pipeline=[
                 dict(type="Rearrange", keys=["frames"], ops="b n c (t1 t) h w -> (b t1) n c t h w", t1=chunk_num),
             ],

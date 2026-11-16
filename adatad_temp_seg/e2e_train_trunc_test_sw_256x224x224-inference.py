@@ -1,5 +1,7 @@
+# Modified from OpenTAD (https://github.com/sming256/OpenTAD), Apache-2.0: copy of configs/_base_/datasets/thumos-14/e2e_train_trunc_test_sw_256x224x224.py with local paths.
+# These paths only matter for training and evaluation; celery_worker.py replaces dataset.test.
 annotation_path = "thumos_14_anno-inference.json"
-class_map = "category_idx.txt"
+class_map = "category_idx_51.txt"
 data_path = "video-inference"
 block_list = None
 

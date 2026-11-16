@@ -1,10 +1,8 @@
 import os
 import numpy as np
 from mmengine.dataset import BaseDataset
-from mmengine.dataset import Compose
-from mmengine.registry import DATASETS
 
-from ..builder import DATASETS, get_class_index
+from ..builder import DATASETS
 import decord
 
 @DATASETS.register_module()

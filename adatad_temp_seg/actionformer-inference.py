@@ -1,3 +1,4 @@
+# Modified from OpenTAD (https://github.com/sming256/OpenTAD), Apache-2.0: copy of configs/_base_/models/actionformer.py with 51 action classes.
 model = dict(
     type="ActionFormer",
     projection=dict(
