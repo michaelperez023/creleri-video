@@ -217,3 +217,24 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# CReLeRI runtime outputs
+web_ui/uploads/
+adatad_temp_seg/shared/
+adatad_temp_seg/thumbnails/
+adatad_temp_seg/segment_*.mp4
+dfine_obj_det/tools/inference/tmp2/
+dump.rdb
+*.mp4
+
+# Local environments and builds created during setup
+web_ui/webui/
+redis/
+
+# Model weights (downloaded separately, see README)
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
